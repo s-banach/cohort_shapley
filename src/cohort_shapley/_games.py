@@ -5,6 +5,7 @@ Measuring each pair's prediction from its own first row makes the gain of a pair
 """
 
 from dataclasses import dataclass
+from typing import Self
 
 import numpy as np
 
@@ -19,15 +20,45 @@ def pair_gains(predictions: FloatArray1D, pairs: IndexArray2D) -> FloatArray1D:
 
 
 @dataclass(frozen=True)
+class Categorical:
+    """A distribution over positions: position k has probability cumulative[k] - cumulative[k - 1], and the last entry of `cumulative` is 1 unless it is empty."""
+
+    cumulative: FloatArray1D
+
+    @classmethod
+    def proportional_to(cls, masses: FloatArray1D) -> Self:
+        """Probabilities proportional to non-negative `masses`, which have a positive sum unless empty."""
+        cumulative = masses.cumsum()
+        return cls(cumulative / cumulative[-1:])
+
+    def draw(self, n: int, rng: np.random.Generator) -> IndexArray1D:
+        """`n` independent positions, each found by binary search for a uniform draw."""
+        return self.cumulative.searchsorted(rng.random(n), side="right")
+
+
+@dataclass(frozen=True)
 class MatchedPairs:
     """Pair k is pairs[k], its first and second row, with positive weight weights[k].
 
-    Draws pick pair k with probability proposal[k], which is positive for every pair.
+    Draws pick pairs from `proposal`, which gives every pair a positive probability, and weight pair k by likelihood_ratios[k]: its weight share divided by its probability under `proposal`.
     """
 
     pairs: IndexArray2D
     weights: FloatArray1D
-    proposal: FloatArray1D
+    proposal: Categorical
+    likelihood_ratios: FloatArray1D
+
+    @classmethod
+    def from_proposal(
+        cls, pairs: IndexArray2D, weights: FloatArray1D, proposal: FloatArray1D
+    ) -> Self:
+        """Draw pair k with probability proposal[k]."""
+        return cls(
+            pairs,
+            weights,
+            Categorical.proportional_to(proposal),
+            weights / (weights.sum() * proposal),
+        )
 
     @property
     def n_pairs(self) -> int:
@@ -38,10 +69,9 @@ class MatchedPairs:
         return float(self.weights.sum())
 
     def draw(self, n: int, rng: np.random.Generator) -> tuple[IndexArray2D, FloatArray1D]:
-        """`n` independent draws, with each drawn pair's likelihood ratio: its weight share divided by its proposal probability."""
-        k = rng.choice(self.n_pairs, size=n, p=self.proposal)
-        ratio = self.weights[k] / (self.weight_total * self.proposal[k])
-        return self.pairs[k], ratio
+        """`n` independent draws, with each drawn pair's likelihood ratio."""
+        k = self.proposal.draw(n, rng)
+        return self.pairs[k], self.likelihood_ratios[k]
 
     def chunk(self, start: int, stop: int) -> tuple[IndexArray2D, FloatArray1D]:
         """Pairs `start` to `stop` and their weights."""
@@ -65,12 +95,33 @@ class IndependentPairs:
     """Every combination of positive-weight rows, with product weights.
 
     `first_rows` and `second_rows` map weight positions to shared row indices.
+    `first_distribution` and `second_distribution` give weight positions probabilities proportional to `first_weights` and `second_weights`.
     """
 
     first_rows: IndexArray1D
     second_rows: IndexArray1D
     first_weights: FloatArray1D
     second_weights: FloatArray1D
+    first_distribution: Categorical
+    second_distribution: Categorical
+
+    @classmethod
+    def from_weights(
+        cls,
+        first_rows: IndexArray1D,
+        second_rows: IndexArray1D,
+        first_weights: FloatArray1D,
+        second_weights: FloatArray1D,
+    ) -> Self:
+        """Draw weight positions in proportion to weight."""
+        return cls(
+            first_rows,
+            second_rows,
+            first_weights,
+            second_weights,
+            Categorical.proportional_to(first_weights),
+            Categorical.proportional_to(second_weights),
+        )
 
     @property
     def n_pairs(self) -> int:
@@ -82,14 +133,8 @@ class IndependentPairs:
 
     def draw(self, n: int, rng: np.random.Generator) -> tuple[IndexArray2D, FloatArray1D]:
         """`n` independent draws in proportion to weight, each with likelihood ratio 1."""
-        second_positions = rng.choice(
-            len(self.second_weights), size=n, p=self.second_weights / self.second_weights.sum()
-        )
-        first_positions = rng.choice(
-            len(self.first_weights),
-            size=n,
-            p=self.first_weights / self.first_weights.sum(),
-        )
+        second_positions = self.second_distribution.draw(n, rng)
+        first_positions = self.first_distribution.draw(n, rng)
         return self._pairs(first_positions, second_positions), np.ones(n)
 
     def chunk(self, start: int, stop: int) -> tuple[IndexArray2D, FloatArray1D]:

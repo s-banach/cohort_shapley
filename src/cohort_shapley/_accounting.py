@@ -87,7 +87,7 @@ def independent_game(
     reference = predictions[reference_row]
     first_mean, first_magnitude = _measured_means(first_population, predictions, reference)
     second_mean, second_magnitude = _measured_means(second_population, predictions, reference)
-    pair_distribution = IndependentPairs(
+    pair_distribution = IndependentPairs.from_weights(
         first_population.rows,
         second_population.rows,
         first_population.weights,
@@ -123,10 +123,9 @@ def matched_game(
     changed, active = model.changes(pairs)
     pairs, weights = pairs[changed], weights[changed]
     gains = pair_gains(predictions, pairs)
-    proposal = defensive_proposal(weights, gains) if len(weights) else np.empty(0)
     return Game(
         predictions,
-        MatchedPairs(pairs, weights, proposal),
+        MatchedPairs.from_proposal(pairs, weights, defensive_proposal(weights, gains)),
         fsum(weights),
         fsum(weights * gains),
         8 * EPS * fsum(weights * np.abs(gains)),
