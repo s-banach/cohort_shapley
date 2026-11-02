@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from cohort_shapley._arrays import BoolArray1D, FloatArray1D, FloatArray2D, UInt8Array2D
-from cohort_shapley._games import EPS, Game
+from cohort_shapley._games import EPS, Game, pair_gains
 from cohort_shapley._model import Model, coalition_sums, contrasts
 from cohort_shapley._shapley import (
     kernel_coalitions,
@@ -334,7 +334,7 @@ def _step(states: list[GameState], wanted: list[int], *, budget: int) -> Step | 
 
 def _enumeration_cost(game: Game) -> int:
     """Model rows to evaluate every pair on every coalition strictly between no active feature groups and all of them."""
-    return game.pairs.n_pairs * (2**game.n_active - 2)
+    return game.pair_distribution.n_pairs * (2**game.n_active - 2)
 
 
 def _advance(
@@ -390,15 +390,15 @@ def _draw(
     masks = np.zeros((min(n, block), len(game.active)), dtype=bool)
     for start in range(0, n, block):
         size = min(block, n - start)
-        first_rows, second_rows, ratio = game.pairs.draw(size, rng)
+        pairs, ratio = game.pair_distribution.draw(size, rng)
         coef = game.scale * ratio
         coalitions = kernel_coalitions(size, game.n_active, rng)
         masks[:size, game.active] = coalitions
         chunks.append(
             DrawChunk(
                 np.packbits(coalitions, axis=1),
-                coef * contrasts(model, first_rows, second_rows, masks[:size]),
-                coef * (game.predictions[second_rows] - game.predictions[first_rows]),
+                coef * contrasts(model, pairs, masks[:size]),
+                coef * pair_gains(game.predictions, pairs),
             )
         )
     return tuple(chunks)
@@ -413,13 +413,13 @@ def _enumerated_fit(model: Model, game: Game) -> GameFit:
         masks[:, bit] = (codes >> bit) & 1
     table = np.zeros(2**n_active)
     table[-1] = game.total
-    pairs = game.pairs
-    weight_total = pairs.weight_total
+    pair_distribution = game.pair_distribution
+    n_pairs, weight_total = pair_distribution.n_pairs, pair_distribution.weight_total
     span = max(1, model.batch_rows // 2)
-    for start in range(0, pairs.n_pairs, span):
-        first_rows, second_rows, weights = pairs.chunk(start, min(start + span, pairs.n_pairs))
+    for start in range(0, n_pairs, span):
+        pairs, weights = pair_distribution.chunk(start, min(start + span, n_pairs))
         coef = game.scale * weights / weight_total
-        table[1:-1] += coalition_sums(model, game, first_rows, second_rows, coef=coef, masks=masks)
+        table[1:-1] += coalition_sums(model, game, pairs, coef=coef, masks=masks)
     del codes, masks
     contributions = np.zeros(len(game.active))
     contributions[game.active] = shapley_values(table)

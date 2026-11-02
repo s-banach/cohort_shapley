@@ -6,13 +6,14 @@ from typing import Self
 
 import numpy as np
 
-from cohort_shapley._arrays import FloatArray1D, IndexArray1D
+from cohort_shapley._arrays import FloatArray1D, IndexArray1D, IndexArray2D
 from cohort_shapley._games import (
     EPS,
     Game,
     IndependentPairs,
     MatchedPairs,
     defensive_proposal,
+    pair_gains,
 )
 from cohort_shapley._model import Model
 
@@ -81,23 +82,22 @@ def independent_game(
     When either population has no rows, the game has no pairs, a total of zero and no active feature groups.
     """
     if not (len(first_population.rows) and len(second_population.rows)):
-        no_rows = np.empty(0, dtype=np.intp)
-        return matched_game(model, predictions, no_rows, no_rows, np.empty(0))
+        return matched_game(model, predictions, np.empty((0, 2), dtype=np.intp), np.empty(0))
     reference_row = first_population.rows[np.argmax(first_population.weights)]
     reference = predictions[reference_row]
     first_mean, first_magnitude = _measured_means(first_population, predictions, reference)
     second_mean, second_magnitude = _measured_means(second_population, predictions, reference)
-    pairs = IndependentPairs(
+    pair_distribution = IndependentPairs(
         first_population.rows,
         second_population.rows,
         first_population.weights,
         second_population.weights,
     )
     rows = np.concatenate((first_population.rows, second_population.rows))
-    _, active = model.changes(np.full(len(rows), reference_row, dtype=np.intp), rows)
+    _, active = model.changes(np.column_stack((np.full(len(rows), reference_row), rows)))
     return Game(
         predictions,
-        pairs,
+        pair_distribution,
         scale,
         scale * (second_mean - first_mean),
         8 * EPS * scale * (first_magnitude + second_magnitude),
@@ -108,8 +108,7 @@ def independent_game(
 def matched_game(
     model: Model,
     predictions: FloatArray1D,
-    first_rows: IndexArray1D,
-    second_rows: IndexArray1D,
+    pairs: IndexArray2D,
     weights: FloatArray1D,
 ) -> Game:
     """Attribute normalized pair weights, retaining unchanged pairs in their normalization.
@@ -120,18 +119,14 @@ def matched_game(
     The total's rounding error is bounded by 8 EPS times the weighted sum of absolute gains.
     """
     positive = weights > 0
-    first_rows, second_rows, weights = (
-        first_rows[positive],
-        second_rows[positive],
-        weights[positive],
-    )
-    changed, active = model.changes(first_rows, second_rows)
-    first_rows, second_rows, weights = first_rows[changed], second_rows[changed], weights[changed]
-    gains = predictions[second_rows] - predictions[first_rows]
+    pairs, weights = pairs[positive], weights[positive]
+    changed, active = model.changes(pairs)
+    pairs, weights = pairs[changed], weights[changed]
+    gains = pair_gains(predictions, pairs)
     proposal = defensive_proposal(weights, gains) if len(weights) else np.empty(0)
     return Game(
         predictions,
-        MatchedPairs(first_rows, second_rows, weights, proposal),
+        MatchedPairs(pairs, weights, proposal),
         fsum(weights),
         fsum(weights * gains),
         8 * EPS * fsum(weights * np.abs(gains)),
@@ -175,7 +170,7 @@ def account(
     reference = predictions[rows_1[np.argmax(pair_weights)]]
     measured = (predictions[rows_1] - reference) + (predictions[rows_2] - reference)
     weight_change = fsum((omega_2 - omega_1) * measured) / 2
-    matched = matched_game(model, predictions, rows_1, rows_2, pair_weights)
+    matched = matched_game(model, predictions, np.column_stack((rows_1, rows_2)), pair_weights)
     matched_1 = WeightedRows.from_weights(rows_1, weights)
     matched_2 = WeightedRows.from_weights(rows_2, weights)
     exits = WeightedRows.from_weights(np.arange(first_n_matched, n_1), weights)

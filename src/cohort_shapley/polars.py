@@ -63,26 +63,22 @@ class PolarsAdapter:
 
     def evaluate(self, pairs: IndexArray2D, selections: BoolArray2D) -> FloatArray1D:
         """Select the features of each pair's second row for true feature group selections and of its first row otherwise."""
-        hybrid = pl.DataFrame(
-            [
-                values.gather(np.where(selections[:, feature_group], pairs[:, 1], pairs[:, 0]))
-                for values, feature_group in zip(
-                    pl.concat((self.cohort_1, self.cohort_2), rechunk=False),
-                    self.feature_group_of_column,
-                    strict=True,
-                )
-            ]
+        rows_of_feature_group = pl.DataFrame(
+            np.where(selections, pairs[:, 1:], pairs[:, :1]), orient="row"
+        ).get_columns()
+        hybrid = pl.concat((self.cohort_1, self.cohort_2), rechunk=False).select(
+            pl.nth(column).gather(rows_of_feature_group[feature_group])
+            for column, feature_group in enumerate(self.feature_group_of_column)
         )
         return np.asarray(self.predict(hybrid), dtype=np.float64)
 
     def differs(self, pairs: IndexArray2D) -> BoolArray2D:
         """Flag a feature group when any of its columns differ under Polars equality."""
+        first, second = pl.Series(pairs[:, 0]), pl.Series(pairs[:, 1])
         return (
             pl.concat((self.cohort_1, self.cohort_2), rechunk=False)
             .select(
-                pl.any_horizontal(
-                    columns.gather(pairs[:, 0]).ne_missing(columns.gather(pairs[:, 1]))
-                )
+                pl.any_horizontal(columns.gather(first).ne_missing(columns.gather(second)))
                 for columns in self._columns_of_feature_group()
             )
             .to_numpy()

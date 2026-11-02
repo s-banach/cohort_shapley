@@ -136,7 +136,7 @@ def decompose_paired(
         used=used,
         max_evals=max_evals,
     )
-    game = matched_game(model, predictions, first_rows, second_rows, w / fsum(w))
+    game = matched_game(model, predictions, np.column_stack((first_rows, second_rows)), w / fsum(w))
     fitted = _estimate([game], model, tol, max_evals - len(used), seed)
     return _attribution(fitted, len(used))
 
@@ -280,7 +280,10 @@ def _endpoints(
         raise ValueError(f"max_evals must cover the {len(used)} used endpoint rows")
     model = Model(adapter, batch_rows)
     predictions = np.zeros(sum(adapter.n_rows))
-    predictions[used] = model.predict(used, used)
+    predictions[used] = model.predict(
+        np.column_stack((used, used)),
+        np.broadcast_to(np.False_, (len(used), adapter.n_feature_groups)),
+    )
     return model, predictions
 
 

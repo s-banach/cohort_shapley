@@ -178,5 +178,8 @@ def test_source_changes_and_same_cohort_gathers() -> None:
 
 def test_column_names_are_literal() -> None:
     frame = pl.DataFrame({"*": [0, 0, 0], "^b.*$": [0, 0, 0], "b": [0, 0, 1]})
-    adapter = PolarsAdapter(frame[:2], frame[2:], lambda x: np.zeros(x.height))
+    adapter = PolarsAdapter(frame[:2], frame[2:], lambda x: x["b"].to_numpy().astype(np.float64))
     np.testing.assert_array_equal(adapter.differs(np.array([[0, 2]])), [[False, False, True]])
+    np.testing.assert_array_equal(
+        adapter.evaluate(np.array([[0, 2]]), np.array([[False, False, True]])), [1]
+    )
