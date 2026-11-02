@@ -6,7 +6,7 @@ Let $C_1,C_2$ be two finite, nonempty cohorts of data in $X$.
 Our goal is to decompose the difference
 
 $$
-\Delta=\operatorname{Mean}_{C_2}(f)-\operatorname{Mean}_{C_1}(f)
+\Delta=\text{Mean}_{C_2}(f)-\text{Mean}_{C_1}(f)
 $$
 
 into the contribution of each of the $d$ features.
@@ -14,8 +14,8 @@ into the contribution of each of the $d$ features.
 A familiar trick is to compute the difference in mean SHAP vectors between the cohorts:
 
 $$
-\operatorname{Mean}_{x\in C_2} S_B(f,x)
--\operatorname{Mean}_{x\in C_1} S_B(f,x),
+\text{Mean}_{x\in C_2} S_B(f,x)
+-\text{Mean}_{x\in C_1} S_B(f,x),
 $$
 
 where $S_B(f,x)\in\mathbb{R}^d$ is the SHAP vector of $f$ at $x$, relative to a fixed background distribution $B$.
