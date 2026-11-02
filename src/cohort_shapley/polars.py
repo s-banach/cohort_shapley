@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from itertools import compress
 
 import numpy as np
 import polars as pl
@@ -75,16 +76,23 @@ class PolarsAdapter:
         return np.asarray(self.predict(hybrid), dtype=np.float64)
 
     def differs(self, pairs: IndexArray2D) -> BoolArray2D:
-        """Combine column differences within each feature group using Polars equality."""
-        first_rows = pl.Series(pairs[:, 0], dtype=pl.get_index_type())
-        second_rows = pl.Series(pairs[:, 1], dtype=pl.get_index_type())
-        changed = np.zeros((len(pairs), self.n_feature_groups), dtype=bool)
-        for values, feature_group in zip(
-            pl.concat((self.cohort_1, self.cohort_2), rechunk=False),
-            self.feature_group_of_column,
-            strict=True,
-        ):
-            changed[:, feature_group] |= (
-                values[first_rows].ne_missing(values[second_rows]).to_numpy()
+        """Flag a feature group when any of its columns differ under Polars equality."""
+        return (
+            pl.concat((self.cohort_1, self.cohort_2), rechunk=False)
+            .select(
+                pl.any_horizontal(
+                    columns.gather(pairs[:, 0]).ne_missing(columns.gather(pairs[:, 1]))
+                )
+                for columns in self._columns_of_feature_group()
             )
-        return changed
+            .to_numpy()
+        )
+
+    def _columns_of_feature_group(self) -> list[pl.Expr]:
+        """Select the columns of each feature group by position."""
+        return [
+            pl.nth(
+                *compress(range(self.cohort_1.width), self.feature_group_of_column == feature_group)
+            )
+            for feature_group in range(self.n_feature_groups)
+        ]
