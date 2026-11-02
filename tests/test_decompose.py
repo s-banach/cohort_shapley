@@ -21,8 +21,11 @@ def test_component_totals_and_contributions_sum_exactly() -> None:
     assert sum(totals) == pytest.approx(result.total, rel=1e-12)
     for component in components(result):
         assert component.contributions.sum() == pytest.approx(component.total, rel=1e-9)
+    assert result.contributions.sum() == pytest.approx(
+        result.total - result.weight_change, rel=1e-9
+    )
     assert result.converged
-    assert result.stderr_total.max() <= 2e-3
+    assert result.stderr.max() <= 2e-3
 
 
 def test_exhaustive_pairs_and_coalitions_match_brute_force() -> None:
@@ -34,7 +37,7 @@ def test_exhaustive_pairs_and_coalitions_match_brute_force() -> None:
     )
     for component, oracle in zip(components(result), expected, strict=True):
         np.testing.assert_allclose(component.contributions, oracle, rtol=0, atol=1e-10)
-    assert result.stderr_total.max() == 0
+    assert result.stderr.max() == 0
     assert result.converged
 
 
@@ -122,7 +125,7 @@ def test_rare_changes_are_attributed_exactly() -> None:
     for component, oracle in zip(components(result), expected, strict=True):
         np.testing.assert_allclose(component.contributions, oracle, rtol=0, atol=1e-12)
     assert result.entry.total == result.exit.total == 0.0
-    assert result.stderr_total.max() == 0
+    assert result.stderr.max() == 0
     assert result.converged
 
 
@@ -144,12 +147,9 @@ def test_rare_large_changes_among_small_ones_are_drawn() -> None:
 
     exact = decompose_frames(predict, d_1, d_2, id_column="id", tol=0.0)
     result = decompose_frames(predict, d_1, d_2, id_column="id", tol=2e-3)
-    assert exact.stderr_total.max() == 0
+    assert exact.stderr.max() == 0
     assert result.converged
-    error = sum(c.contributions for c in components(result)) - sum(
-        c.contributions for c in components(exact)
-    )
-    assert np.abs(error).max() <= 2e-3
+    assert np.abs(result.contributions - exact.contributions).max() <= 2e-3
 
 
 def _one_entrant_differs(n: int, offset: float) -> tuple[PredictFrame, pl.DataFrame, pl.DataFrame]:
@@ -182,7 +182,7 @@ def test_game_with_one_non_null_feature_group_is_exact() -> None:
     full_rows = d_1.height + d_2.height
     result = decompose_frames(predict, d_1, d_2, id_column="id", max_evals=full_rows)
     assert result.entry.contributions.tolist() == [result.entry.total, 0.0]
-    assert result.stderr_total.max() == 0
+    assert result.stderr.max() == 0
     assert result.n_evals == full_rows
     assert result.converged
 
@@ -308,7 +308,7 @@ def test_small_budget_shrinks_the_first_round_and_stops() -> None:
     result = decompose_frames(nonlinear, d_1, d_2, id_column="id", max_evals=max_evals)
     assert not result.converged
     assert result.n_evals == max_evals
-    assert np.all(np.isfinite(result.stderr_total) & (result.stderr_total > 0))
+    assert np.all(np.isfinite(result.stderr) & (result.stderr > 0))
 
 
 def test_a_singular_fit_gives_infinite_standard_errors_to_its_active_feature_groups() -> None:
@@ -321,7 +321,7 @@ def test_a_singular_fit_gives_infinite_standard_errors_to_its_active_feature_gro
     )
     assert not result.converged
     assert result.matched.stderr.tolist() == [np.inf, np.inf, np.inf, 0.0]
-    assert result.stderr_total.tolist() == [np.inf, np.inf, np.inf, 0.0]
+    assert result.stderr.tolist() == [np.inf, np.inf, np.inf, 0.0]
     assert result.matched.contributions[3] == 0.0
     assert result.matched.contributions.sum() == pytest.approx(result.matched.total, rel=1e-9)
 
@@ -375,7 +375,7 @@ def test_unchanged_matched_units_without_other_games_give_zero_attributions() ->
     assert result.weight_change != 0
     for component in components(result):
         np.testing.assert_array_equal(component.contributions, 0.0)
-    np.testing.assert_array_equal(result.stderr_total, 0.0)
+    np.testing.assert_array_equal(result.stderr, 0.0)
 
 
 def test_first_round_reserves_one_draw_per_game_before_enumerating() -> None:

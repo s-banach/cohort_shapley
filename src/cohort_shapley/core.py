@@ -81,7 +81,7 @@ class Decomposition:
     """The matched, entry and exit components, and the weight change, which has no feature allocation.
 
     `n_evals` counts evaluated rows, endpoint rows included.
-    `converged` says whether every entry of `stderr_total` is at most `tol` and every sampled component passed its convergence checks.
+    `converged` says whether every entry of `stderr` is at most `tol` and every sampled component passed its convergence checks.
     """
 
     matched: Component
@@ -97,8 +97,13 @@ class Decomposition:
         return fsum((self.matched.total, self.entry.total, self.exit.total, self.weight_change))
 
     @property
-    def stderr_total(self) -> FloatArray1D:
-        """The standard error of each feature group's summed contribution, combining the independently sampled components."""
+    def contributions(self) -> FloatArray1D:
+        """Each feature group's contribution summed over the three components; these sum to `total` minus `weight_change`."""
+        return self.matched.contributions + self.entry.contributions + self.exit.contributions
+
+    @property
+    def stderr(self) -> FloatArray1D:
+        """The standard error of each entry of `contributions`, combining the independently sampled components."""
         return stderr_total([self.matched.stderr, self.entry.stderr, self.exit.stderr])
 
 

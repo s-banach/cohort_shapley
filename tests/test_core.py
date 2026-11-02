@@ -152,7 +152,7 @@ def test_three_operations_agree_with_pair_oracle(*, grouped: bool) -> None:
         w_2 @ adapter.predict(values[4:]) / w_2.sum()
         - w_1 @ adapter.predict(values[:4]) / w_1.sum()
     )
-    np.testing.assert_array_equal(decomposed.stderr_total, 0)
+    np.testing.assert_array_equal(decomposed.stderr, 0)
     np.testing.assert_array_equal(contributions[-1], 0)
 
 

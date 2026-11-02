@@ -68,7 +68,7 @@ The other parameters are keyword-only.
 
 | Parameter | Meaning |
 |---|---|
-| `tol` | Required largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each group's `stderr`, or `stderr_total` for turnover |
+| `tol` | Required largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each entry of the result's `stderr` |
 | `first_n_matched` | Turnover only, required: number of leading rows of each cohort that form matched pairs |
 | `weights=None` | One weight per aligned pair for paired decomposition; tuple of cohort weights for independent pairs and turnover |
 | `batch_rows=8192` | Maximum observations passed to `evaluate` or `differs` in one call |
@@ -89,7 +89,8 @@ Retained sampling draws can require roughly 500 MB at the default evaluation bud
 Each has `contributions` and `stderr` with one entry per feature group, and a `total` that its contributions sum to.
 `Decomposition.weight_change` is a number with no feature allocation.
 The three component totals and `weight_change` sum to `Decomposition.total`.
-`stderr_total` combines the independent sampling variances of the three components for each group.
+`Decomposition.contributions` adds each group's contributions over the three components, so it sums to `total` minus `weight_change` up to floating-point error.
+`Decomposition.stderr` gives its standard errors, combining the independent sampling variances of the three components.
 
 Both result types report `n_evals` and `converged`.
 `n_evals` counts evaluated observations, not calls to the model.
@@ -203,6 +204,7 @@ result = decompose_with_turnover(adapter, first_n_matched=1, tol=1e-3)
 np.testing.assert_allclose(result.matched.contributions, [2.0])
 np.testing.assert_allclose(result.entry.contributions, [9.0])
 np.testing.assert_allclose(result.exit.contributions, [-5.0])
+np.testing.assert_allclose(result.contributions, [6.0])
 assert result.weight_change == 0.0
 np.testing.assert_allclose(result.total, 21.0 - 15.0)
 ```
