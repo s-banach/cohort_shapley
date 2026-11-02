@@ -8,16 +8,12 @@ An adapter replaces selected features between paired observations, calls your pr
 `NumpyAdapter` and `PolarsAdapter` are included.
 
 `NumpyAdapter` works with any prediction function that accepts NumPy batches and returns NumPy predictions.
-That function can convert each batch to pandas or PyTorch inputs before calling the model.
 To perform feature replacement in another data format, implement the [adapter interface](#adapter-interface) for that format; the decomposition functions stay the same.
-
-With Python 3.12+, install from a checkout using `python -m pip install .`.
 
 ## Decompose paired changes
 
 This example fits a Poisson gradient boosting model, then compares cohorts $C_1$ and $C_2$ containing the same two entities.
 `model.predict` applies the inverse link and returns predictions in response units.
-Install scikit-learn for the example with `python -m pip install scikit-learn`.
 Stacking $C_1$ before $C_2$ gives pairs of row indices `(0, 2)` and `(1, 3)`.
 
 ```python
@@ -158,7 +154,6 @@ It compares bytes when detecting unchanged features, including signed zero and N
 C-order, F-order, and strided source arrays are supported; hybrid arrays passed to `predict` have C order.
 Keep the source array unchanged during the calculation.
 
-Install Polars support with `python -m pip install '.[polars]'`.
 `PolarsAdapter(frame, predict, feature_group_of_column=...)` preserves column names and dtypes in a Polars DataFrame.
 Import it from `cohort_shapley.polars`; the top-level package works without installing Polars.
 Object columns are unsupported.
