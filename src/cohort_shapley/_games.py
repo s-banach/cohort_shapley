@@ -109,6 +109,7 @@ class Game:
 
     `predictions` uses shared row indices.
     `total` is the gain of all feature groups, and `total_rounding_bound` bounds its rounding error.
+    `active` has one entry per feature group and marks the active feature groups; the others are null feature groups.
     Exchanging a null feature group within any pair cannot affect a prediction.
     """
 
@@ -117,8 +118,8 @@ class Game:
     scale: float
     total: float
     total_rounding_bound: float
-    null_feature_groups: BoolArray1D
+    active: BoolArray1D
 
     @property
-    def active_feature_groups(self) -> IndexArray1D:
-        return np.flatnonzero(~self.null_feature_groups)
+    def n_active(self) -> int:
+        return int(self.active.sum())

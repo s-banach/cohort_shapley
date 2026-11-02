@@ -101,7 +101,7 @@ def independent_game(
         scale,
         scale * (second_mean - first_mean),
         8 * EPS * scale * (first_magnitude + second_magnitude),
-        ~active,
+        active,
     )
 
 
@@ -135,7 +135,7 @@ def matched_game(
         fsum(weights),
         fsum(weights * gains),
         8 * EPS * fsum(weights * np.abs(gains)),
-        ~active,
+        active,
     )
 
 

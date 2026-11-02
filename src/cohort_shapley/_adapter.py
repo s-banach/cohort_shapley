@@ -49,8 +49,8 @@ class Adapter(Protocol):
 
 def column_feature_groups(
     n_columns: int, feature_group_of_column: Sequence[int] | None
-) -> tuple[IndexArray1D, int]:
-    """A read-only copy of an assignment whose feature group indices cover consecutive integers starting at zero, and the number of feature groups."""
+) -> IndexArray1D:
+    """A read-only copy of an assignment whose feature group indices cover consecutive integers starting at zero."""
     if n_columns == 0:
         raise ValueError("at least one feature column is required")
     feature_groups = (
@@ -65,4 +65,4 @@ def column_feature_groups(
         )
     result = np.array(feature_groups, dtype=np.intp, copy=True)
     result.flags.writeable = False
-    return result, len(unique)
+    return result

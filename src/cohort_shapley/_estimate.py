@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from cohort_shapley._arrays import FloatArray1D, FloatArray2D, IndexArray1D, UInt8Array2D
+from cohort_shapley._arrays import BoolArray1D, FloatArray1D, FloatArray2D, UInt8Array2D
 from cohort_shapley._games import EPS, Game
 from cohort_shapley._model import Model, coalition_sums, contrasts
 from cohort_shapley._shapley import (
@@ -159,7 +159,7 @@ def _blocks(
 
 @dataclass(frozen=True)
 class GameState:
-    """A game, its draws and its fit.
+    """A game, its draws, its fit and the model rows spent on it.
 
     An exact game has no draws.
     A sampled game without draws has the fit of no draws.
@@ -169,14 +169,11 @@ class GameState:
     draws: tuple[DrawChunk, ...]
     fit: GameFit
     exact: bool
+    n_evals: int
 
     @property
     def n_draws(self) -> int:
         return sum(len(chunk.contrasts) for chunk in self.draws)
-
-    @property
-    def n_active(self) -> int:
-        return len(self.game.active_feature_groups)
 
 
 @dataclass(frozen=True)
@@ -230,8 +227,8 @@ def estimate(
     Raises ValueError when the allowance cannot fund one draw of every sampled game.
     """
     states = [_initial_state(g) for g in games]
-    n_evals = 0
     while True:
+        n_evals = sum(s.n_evals for s in states)
         fits = [s.fit for s in states]
         if (
             all(f.checks_pass for f in fits)
@@ -241,23 +238,20 @@ def estimate(
         step = _step(states, _wanted_draws(states, tol), budget=budget - n_evals)
         if step is None:
             return Estimate(_components(states), n_evals, converged=False)
-        advanced = [
+        states = [
             _advance(model, s, enumerate_game=enumerate_game, new_draws=new, rng=rng)
             for s, enumerate_game, new in zip(states, step.enumerate, step.new_draws, strict=True)
         ]
-        states = [s for s, _ in advanced]
-        n_evals += sum(spent for _, spent in advanced)
 
 
 def _initial_state(game: Game) -> GameState:
     """A game with at most one active feature group is exact: that feature group gets the whole total, and a game without active feature groups has a total of zero."""
-    active = game.active_feature_groups
-    if len(active) <= 1:
-        contributions = np.where(game.null_feature_groups, 0.0, game.total)
+    if game.n_active <= 1:
+        contributions = np.where(game.active, game.total, 0.0)
         fit = GameFit(contributions, np.zeros_like(contributions), checks_pass=True)
-        return GameState(game, (), fit, exact=True)
-    fit = _expanded(_no_draws_fit(len(active), game.total), active, len(game.null_feature_groups))
-    return GameState(game, (), fit, exact=False)
+        return GameState(game, (), fit, exact=True, n_evals=0)
+    fit = _expanded(_no_draws_fit(game.n_active, game.total), game.active)
+    return GameState(game, (), fit, exact=False, n_evals=0)
 
 
 def _components(states: list[GameState]) -> list[Component]:
@@ -313,7 +307,7 @@ def _step(states: list[GameState], wanted: list[int], *, budget: int) -> Step | 
         cost = _enumeration_cost(state.game)
         chosen = (
             new[i] > 0
-            and 2**state.n_active <= MAX_ENUMERATED_COALITIONS
+            and 2**state.game.n_active <= MAX_ENUMERATED_COALITIONS
             and cost <= 2 * wanted[i]
             and cost <= budget - (sum(reserve) - reserve[i])
         )
@@ -340,7 +334,7 @@ def _step(states: list[GameState], wanted: list[int], *, budget: int) -> Step | 
 
 def _enumeration_cost(game: Game) -> int:
     """Model rows to evaluate every pair on every coalition strictly between no active feature groups and all of them."""
-    return game.pairs.n_pairs * (2 ** len(game.active_feature_groups) - 2)
+    return game.pairs.n_pairs * (2**game.n_active - 2)
 
 
 def _advance(
@@ -350,33 +344,39 @@ def _advance(
     enumerate_game: bool,
     new_draws: int,
     rng: np.random.Generator,
-) -> tuple[GameState, int]:
-    """`state` after enumerating it or adding `new_draws` draws, and the model rows spent."""
+) -> GameState:
+    """`state` after enumerating it or adding `new_draws` draws."""
+    game = state.game
     if enumerate_game:
-        return GameState(state.game, (), _enumerated_fit(model, state.game), exact=True), (
-            _enumeration_cost(state.game)
+        return replace(
+            state,
+            draws=(),
+            fit=_enumerated_fit(model, game),
+            exact=True,
+            n_evals=state.n_evals + _enumeration_cost(game),
         )
     if new_draws == 0:
-        return state, 0
-    game = state.game
+        return state
     draws = state.draws + _draw(model, game, new_draws, FIT_BLOCK, rng)
-    active = game.active_feature_groups
     fitted = fit_draws(
         draws,
-        len(active),
+        game.n_active,
         game.total,
         game.total_rounding_bound,
         FIT_BLOCK,
     )
-    fit = _expanded(fitted, active, len(game.null_feature_groups))
-    spent = 2 * new_draws
-    return replace(state, draws=draws, fit=fit), spent
+    return replace(
+        state,
+        draws=draws,
+        fit=_expanded(fitted, game.active),
+        n_evals=state.n_evals + 2 * new_draws,
+    )
 
 
-def _expanded(fit: GameFit, active: IndexArray1D, n_feature_groups: int) -> GameFit:
+def _expanded(fit: GameFit, active: BoolArray1D) -> GameFit:
     """`fit` over the active feature groups extended to every feature group, with zeros for the null feature groups."""
-    contributions = np.zeros(n_feature_groups)
-    stderr = np.zeros(n_feature_groups)
+    contributions = np.zeros(len(active))
+    stderr = np.zeros(len(active))
     contributions[active] = fit.contributions
     stderr[active] = fit.stderr
     return GameFit(contributions, stderr, checks_pass=fit.checks_pass)
@@ -386,16 +386,14 @@ def _draw(
     model: Model, game: Game, n: int, block: int, rng: np.random.Generator
 ) -> tuple[DrawChunk, ...]:
     """`n` new draws of `game`, in chunks of `block` draws."""
-    active = game.active_feature_groups
-    n_feature_groups = len(game.null_feature_groups)
     chunks = []
-    masks = np.zeros((min(n, block), n_feature_groups), dtype=bool)
+    masks = np.zeros((min(n, block), len(game.active)), dtype=bool)
     for start in range(0, n, block):
         size = min(block, n - start)
         first_rows, second_rows, ratio = game.pairs.draw(size, rng)
         coef = game.scale * ratio
-        coalitions = kernel_coalitions(size, len(active), rng)
-        masks[:size, active] = coalitions
+        coalitions = kernel_coalitions(size, game.n_active, rng)
+        masks[:size, game.active] = coalitions
         chunks.append(
             DrawChunk(
                 np.packbits(coalitions, axis=1),
@@ -408,8 +406,7 @@ def _draw(
 
 def _enumerated_fit(model: Model, game: Game) -> GameFit:
     """The exact Shapley values of `game` from every pair on every coalition of its active feature groups, with pairs taken max(1, batch_rows // 2) at a time."""
-    active = game.active_feature_groups
-    n_active = len(active)
+    n_active = game.n_active
     codes = np.arange(1, 2**n_active - 1)
     masks = np.zeros((len(codes), n_active), dtype=bool)
     for bit in range(n_active):
@@ -424,6 +421,6 @@ def _enumerated_fit(model: Model, game: Game) -> GameFit:
         coef = game.scale * weights / weight_total
         table[1:-1] += coalition_sums(model, game, first_rows, second_rows, coef=coef, masks=masks)
     del codes, masks
-    contributions = np.zeros(len(game.null_feature_groups))
-    contributions[active] = shapley_values(table)
+    contributions = np.zeros(len(game.active))
+    contributions[game.active] = shapley_values(table)
     return GameFit(contributions, np.zeros_like(contributions), checks_pass=True)

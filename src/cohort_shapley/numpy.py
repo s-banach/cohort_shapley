@@ -35,7 +35,6 @@ class NumpyAdapter[T: np.generic]:
     cohort_2: Array2D[T]
     predict: PredictArray[T]
     feature_group_of_column: IndexArray1D
-    n_feature_groups: int
 
     def __init__(
         self,
@@ -57,7 +56,7 @@ class NumpyAdapter[T: np.generic]:
         self.cohort_1 = cohort_1
         self.cohort_2 = cohort_2
         self.predict = predict
-        self.feature_group_of_column, self.n_feature_groups = column_feature_groups(
+        self.feature_group_of_column = column_feature_groups(
             cohort_1.shape[1], feature_group_of_column
         )
 
@@ -65,6 +64,11 @@ class NumpyAdapter[T: np.generic]:
     def n_rows(self) -> tuple[int, int]:
         """Row counts in cohort order."""
         return self.cohort_1.shape[0], self.cohort_2.shape[0]
+
+    @property
+    def n_feature_groups(self) -> int:
+        """One more than the largest index in `feature_group_of_column`."""
+        return int(self.feature_group_of_column.max()) + 1
 
     def evaluate(self, pairs: IndexArray2D, selections: BoolArray2D) -> FloatArray1D:
         """Select the features of each pair's second row for true feature group selections and of its first row otherwise."""

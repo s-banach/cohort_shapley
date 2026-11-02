@@ -100,12 +100,11 @@ def coalition_sums(
     `masks` has one column per active feature group of `game`.
     """
     sums = np.zeros(len(masks))
-    active = game.active_feature_groups
     per_call = max(1, model.batch_rows // len(first_rows))
     for first in range(0, len(masks), per_call):
         block = masks[first : first + per_call]
-        selections = np.zeros((len(block) * len(first_rows), model.n_feature_groups), dtype=bool)
-        selections[:, active] = np.repeat(block, len(first_rows), axis=0)
+        selections = np.zeros((len(block) * len(first_rows), len(game.active)), dtype=bool)
+        selections[:, game.active] = np.repeat(block, len(first_rows), axis=0)
         f = model.predict(
             np.tile(first_rows, len(block)),
             np.tile(second_rows, len(block)),
