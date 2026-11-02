@@ -30,8 +30,8 @@ import sys
 sys.modules["polars"] = None
 import numpy as np
 from cohort_shapley import decompose_with_turnover, NumpyAdapter
-adapter = NumpyAdapter(np.array([[0.0, 0.0], [1.0, 2.0]]), lambda rows: rows.sum(axis=1))
-decompose_with_turnover(adapter, n_rows=(1, 1), pairs=(np.array([0]), np.array([1])), batch_rows=64)
+adapter = NumpyAdapter(np.array([[0.0, 0.0]]), np.array([[1.0, 2.0]]), lambda rows: rows.sum(axis=1))
+decompose_with_turnover(adapter, pairs=(np.array([0]), np.array([0])), batch_rows=64)
 """,
         ],
         check=True,
@@ -46,6 +46,10 @@ class CheckedAdapter:
     batch_rows: int
     evaluations: int = 0
     endpoints: list[int] = field(default_factory=list)
+
+    @property
+    def n_rows(self) -> tuple[int, int]:
+        return self.adapter.n_rows
 
     @property
     def n_feature_groups(self) -> int:
@@ -69,31 +73,32 @@ class CheckedAdapter:
 def test_three_operations_agree_with_pair_oracle(*, grouped: bool) -> None:
     values = np.random.default_rng(21).normal(size=(8, 4))
     values[:, 3] = 0
-    feature_groups = np.array([0, 0, 1, 2]) if grouped else np.arange(4)
-    n_feature_groups = int(feature_groups.max()) + 1
+    feature_groups = [0, 0, 1, 2] if grouped else range(4)
+    n_feature_groups = max(feature_groups) + 1
     adapter = NumpyAdapter(
-        values,
+        values[:4],
+        values[4:],
         lambda x: x[:, 0] * x[:, 1] + x[:, 2] + x[:, 3],
         feature_group_of_column=feature_groups,
     )
-    pairs = (np.array([0, 1]), np.array([4, 5]))
-    pair_weights = np.array([1.0, 3.0])
-    matched = core.decompose_supplied_pairs(
+    pairs = (np.array([0, 1]), np.array([0, 1]))
+    pair_weights = np.array([1.0, 3.0, 0.0, 0.0])
+    matched = core.decompose_paired(
         adapter,
-        n_rows=(4, 4),
         batch_rows=64,
-        pairs=pairs,
         weights=pair_weights,
         tol=0,
     )
     expected = pair_contributions(
-        adapter.evaluate, np.column_stack(pairs), pair_weights, n_feature_groups
+        adapter.evaluate,
+        np.column_stack((np.arange(4), np.arange(4, 8))),
+        pair_weights,
+        n_feature_groups,
     )
     np.testing.assert_allclose(matched.contributions, expected, atol=1e-14)
     w_1, w_2 = np.array([1.0, 3.0, 2.0, 4.0]), np.array([4.0, 2.0, 3.0, 1.0])
     independent = core.decompose_independent_pairs(
         adapter,
-        n_rows=(4, 4),
         batch_rows=64,
         weights=(w_1, w_2),
         tol=0,
@@ -105,7 +110,6 @@ def test_three_operations_agree_with_pair_oracle(*, grouped: bool) -> None:
     np.testing.assert_allclose(independent.contributions, expected, atol=1e-14)
     decomposed = core.decompose_with_turnover(
         adapter,
-        n_rows=(4, 4),
         batch_rows=64,
         weights=(w_1, w_2),
         pairs=pairs,
@@ -113,7 +117,7 @@ def test_three_operations_agree_with_pair_oracle(*, grouped: bool) -> None:
     )
     expected_matched = pair_contributions(
         adapter.evaluate,
-        np.column_stack(pairs),
+        np.column_stack((pairs[0], pairs[1] + 4)),
         (w_1[:2] / w_1[:2].sum() + w_2[:2] / w_2[:2].sum()) / 2,
         n_feature_groups,
     )
@@ -149,14 +153,10 @@ def test_three_operations_agree_with_pair_oracle(*, grouped: bool) -> None:
 @pytest.mark.parametrize("batch_rows", [1, 3, 4, 64])
 def test_only_used_endpoints_are_evaluated_and_calls_respect_batch_rows(batch_rows: int) -> None:
     values = np.arange(12.0).reshape(6, 2)
-    adapter = CheckedAdapter(
-        NumpyAdapter(values, predict, feature_group_of_column=np.arange(2)), batch_rows
-    )
-    result = core.decompose_supplied_pairs(
+    adapter = CheckedAdapter(NumpyAdapter(values[:3], values[3:], predict), batch_rows)
+    result = core.decompose_paired(
         adapter,
-        n_rows=(3, 3),
-        pairs=(np.array([0, 0, 1]), np.array([3, 3, 4])),
-        weights=np.array([1.0, 2.0, 0.0]),
+        weights=np.array([1.0, 0.0, 0.0]),
         batch_rows=batch_rows,
         max_evals=100,
     )
@@ -165,7 +165,6 @@ def test_only_used_endpoints_are_evaluated_and_calls_respect_batch_rows(batch_ro
     independent_adapter = CheckedAdapter(adapter.adapter, batch_rows)
     independent = core.decompose_independent_pairs(
         independent_adapter,
-        n_rows=(3, 3),
         weights=(np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
         batch_rows=batch_rows,
         max_evals=100,
@@ -175,9 +174,8 @@ def test_only_used_endpoints_are_evaluated_and_calls_respect_batch_rows(batch_ro
     decomposition_adapter = CheckedAdapter(adapter.adapter, batch_rows)
     decomposition = core.decompose_with_turnover(
         decomposition_adapter,
-        n_rows=(3, 3),
         weights=(np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
-        pairs=(np.array([0, 1, 2]), np.array([3, 4, 5])),
+        pairs=(np.array([0, 1, 2]), np.array([0, 1, 2])),
         batch_rows=batch_rows,
         max_evals=100,
     )
@@ -191,26 +189,24 @@ def test_only_used_endpoints_are_evaluated_and_calls_respect_batch_rows(batch_ro
 def test_enumeration_requires_coalitions_to_fit_batch(
     batch_rows: int, expected_evals: int, *, converged: bool
 ) -> None:
-    adapter = NumpyAdapter(
-        np.array([[0.0, 0.0], [1.0, 2.0]]), predict, feature_group_of_column=np.arange(2)
-    )
-    result = core.decompose_independent_pairs(
-        adapter, n_rows=(1, 1), batch_rows=batch_rows, max_evals=102
-    )
+    adapter = NumpyAdapter(np.array([[0.0, 0.0]]), np.array([[1.0, 2.0]]), predict)
+    result = core.decompose_independent_pairs(adapter, batch_rows=batch_rows, max_evals=102)
     assert result.n_evals == expected_evals
     assert result.converged == converged
     np.testing.assert_allclose(result.contributions, [2.0, 3.0], atol=1e-14)
 
 
-def test_decomposition_without_matches_equals_independent_attribution() -> None:
-    adapter = NumpyAdapter(
-        np.random.default_rng(0).normal(size=(50, 2)), predict, feature_group_of_column=np.arange(2)
-    )
-    independent = core.decompose_independent_pairs(
-        adapter, n_rows=(20, 30), batch_rows=32, max_evals=2050, seed=3
-    )
+@pytest.mark.parametrize(
+    "pairs", [None, (np.array([], dtype=np.intp), np.array([], dtype=np.intp))]
+)
+def test_decomposition_without_matches_equals_independent_attribution(
+    pairs: tuple[core.IndexArray1D, core.IndexArray1D] | None,
+) -> None:
+    values = np.random.default_rng(0).normal(size=(50, 2))
+    adapter = NumpyAdapter(values[:20], values[20:], predict)
+    independent = core.decompose_independent_pairs(adapter, batch_rows=32, max_evals=2050, seed=3)
     decomposed = core.decompose_with_turnover(
-        adapter, n_rows=(20, 30), batch_rows=32, max_evals=2050, seed=3
+        adapter, pairs=pairs, batch_rows=32, max_evals=2050, seed=3
     )
     np.testing.assert_array_equal(decomposed.contributions[:, 1], independent.contributions)
     np.testing.assert_array_equal(decomposed.stderr[:, 1], independent.stderr)
@@ -225,6 +221,10 @@ def test_overreported_differences_preserve_attributions() -> None:
         adapter: core.Adapter
 
         @property
+        def n_rows(self) -> tuple[int, int]:
+            return self.adapter.n_rows
+
+        @property
         def n_feature_groups(self) -> int:
             return self.adapter.n_feature_groups
 
@@ -237,15 +237,13 @@ def test_overreported_differences_preserve_attributions() -> None:
             return np.ones((len(pairs), self.n_feature_groups), dtype=bool)
 
     values = np.array([[0.0, 0.0, 5.0], [1.0, 2.0, 5.0], [0.0, 0.0, 5.0], [3.0, 4.0, 5.0]])
-    adapter = NumpyAdapter(values, predict, feature_group_of_column=np.arange(3))
+    adapter = NumpyAdapter(values[:2], values[2:], predict)
     expected = pair_contributions(
         adapter.evaluate, np.array([[0, 2], [1, 3]]), np.array([9.0, 1.0]), 3
     )
 
-    result = core.decompose_supplied_pairs(
+    result = core.decompose_paired(
         ConservativeAdapter(adapter),
-        n_rows=(2, 2),
-        pairs=(np.array([0, 1]), np.array([2, 3])),
         weights=np.array([9.0, 1.0]),
         batch_rows=16,
         tol=0,
@@ -257,49 +255,54 @@ def test_overreported_differences_preserve_attributions() -> None:
 @pytest.mark.parametrize(
     "pairs",
     [
-        (np.array([0, 0]), np.array([2, 3])),
-        (np.array([0, 1]), np.array([2, 2])),
+        (np.array([0, 0]), np.array([0, 1])),
+        (np.array([0, 1]), np.array([0, 0])),
         (np.array([2]), np.array([0])),
-        (np.array([-1]), np.array([2])),
-        (np.array([0]), np.array([4])),
+        (np.array([-1]), np.array([0])),
+        (np.array([0]), np.array([3])),
+        (np.array([0]), np.array([-1])),
+        (np.array([0, 1]), np.array([0])),
     ],
 )
 def test_invalid_turnover_pairs_raise(
     pairs: tuple[core.IndexArray1D, core.IndexArray1D],
 ) -> None:
-    adapter = NumpyAdapter(np.ones((4, 2)), predict, feature_group_of_column=np.arange(2))
+    adapter = NumpyAdapter(np.ones((2, 2)), np.ones((3, 2)), predict)
     with pytest.raises(ValueError, match="pair"):
-        core.decompose_with_turnover(adapter, n_rows=(2, 2), pairs=pairs, batch_rows=8)
+        core.decompose_with_turnover(adapter, pairs=pairs, batch_rows=8)
 
 
-def test_matched_pairs_can_repeat_and_reverse_rows_across_cohorts() -> None:
+def test_paired_cohorts_require_equal_row_counts() -> None:
+    adapter = NumpyAdapter(np.ones((1, 2)), np.ones((2, 2)), predict)
+    with pytest.raises(ValueError, match="equal row counts"):
+        core.decompose_paired(adapter, batch_rows=8)
+
+
+def test_turnover_pairs_index_each_cohort() -> None:
     adapter = NumpyAdapter(
-        np.array([[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]]),
-        predict,
-        feature_group_of_column=np.arange(2),
+        np.array([[2.0], [10.0]]),
+        np.array([[15.0], [20.0], [25.0]]),
+        lambda rows: rows[:, 0],
     )
-    pairs = np.array([[2, 0], [2, 0], [0, 1]])
-    result = core.decompose_supplied_pairs(
-        adapter,
-        n_rows=(1, 2),
-        pairs=(pairs[:, 0], pairs[:, 1]),
-        batch_rows=8,
-        tol=0,
+    result = core.decompose_with_turnover(
+        adapter, pairs=(np.array([1]), np.array([0])), batch_rows=8, tol=0
     )
-    np.testing.assert_allclose(
-        result.contributions, pair_contributions(adapter.evaluate, pairs, np.ones(3), 2), atol=1e-14
-    )
+    np.testing.assert_allclose(result.contributions, [[5.0, 5.0, 4.0]])
+    assert result.total == pytest.approx(14.0)
+    assert result.component_totals["weight_change"] == 0
 
 
 @pytest.mark.parametrize("n_feature_groups", [2, 8, 25, 50])
 def test_stored_draw_payload_obeys_evaluation_bound(n_feature_groups: int) -> None:
+    values = np.random.default_rng(0).normal(size=(6, n_feature_groups))
     adapter = NumpyAdapter(
-        np.random.default_rng(0).normal(size=(6, n_feature_groups)),
+        values[:3],
+        values[3:],
         lambda x: x.sum(axis=1),
-        feature_group_of_column=np.arange(n_feature_groups),
+        feature_group_of_column=range(n_feature_groups),
     )
     model = Model(adapter, 64)
-    predictions = np.asarray(adapter.predict(adapter.values), dtype=np.float64)
+    predictions = np.asarray(adapter.predict(values), dtype=np.float64)
     game = matched_game(model, predictions, np.arange(3), np.arange(3, 6), np.full(3, 1 / 3))
     max_evals = 1000
     draws = _draw(model, game, (max_evals - 6) // 2, 32, np.random.default_rng(1))
@@ -310,12 +313,13 @@ def test_stored_draw_payload_obeys_evaluation_bound(n_feature_groups: int) -> No
 
 def test_a_non_finite_hybrid_prediction_raises() -> None:
     adapter = NumpyAdapter(
-        np.array([[0.0, 0.0], [1.0, 1.0]]),
+        np.array([[0.0, 0.0]]),
+        np.array([[1.0, 1.0]]),
         lambda rows: np.where(rows[:, 0] != rows[:, 1], np.nan, 1.0),
     )
 
     with pytest.raises(ValueError, match="non-finite prediction"):
-        core.decompose_independent_pairs(adapter, n_rows=(1, 1), batch_rows=8)
+        core.decompose_independent_pairs(adapter, batch_rows=8)
 
 
 @pytest.mark.parametrize(
@@ -329,36 +333,32 @@ def test_a_non_finite_hybrid_prediction_raises() -> None:
     ],
 )
 def test_invalid_pair_weights_raise(weights: core.FloatArray1D) -> None:
-    adapter = NumpyAdapter(np.ones((4, 2)), predict, feature_group_of_column=np.arange(2))
+    adapter = NumpyAdapter(np.ones((2, 2)), np.ones((2, 2)), predict)
     with pytest.raises(ValueError, match="weight"):
-        core.decompose_supplied_pairs(
+        core.decompose_paired(
             adapter,
-            n_rows=(2, 2),
-            pairs=(np.array([0, 1]), np.array([2, 3])),
             weights=weights,
             batch_rows=8,
         )
 
 
 def test_enumeration_counts_previous_sampling_toward_its_cost() -> None:
+    values = np.random.default_rng(3).normal(size=(2200, 2))
     adapter = NumpyAdapter(
-        np.random.default_rng(3).normal(size=(2200, 2)),
+        values[:1100],
+        values[1100:],
         predict,
-        feature_group_of_column=np.arange(2),
+        feature_group_of_column=range(2),
     )
     pairs = (np.arange(1100), np.arange(1100, 2200))
-    pilot = core.decompose_supplied_pairs(
+    pilot = core.decompose_paired(
         adapter,
-        n_rows=(1100, 1100),
-        pairs=pairs,
         batch_rows=8192,
         tol=0,
         max_evals=4120,
     )
-    result = core.decompose_supplied_pairs(
+    result = core.decompose_paired(
         adapter,
-        n_rows=(1100, 1100),
-        pairs=pairs,
         batch_rows=8192,
         tol=0.99 * float(pilot.stderr.max()),
         max_evals=10_000,
@@ -386,11 +386,10 @@ def test_enumeration_counts_previous_sampling_toward_its_cost() -> None:
 def test_invalid_estimation_options_raise(
     tol: float, max_evals: int, batch_rows: int, message: str
 ) -> None:
-    adapter = NumpyAdapter(np.ones((4, 2)), predict)
+    adapter = NumpyAdapter(np.ones((2, 2)), np.ones((2, 2)), predict)
     with pytest.raises(ValueError, match=message):
         core.decompose_with_turnover(
             adapter,
-            n_rows=(2, 2),
             batch_rows=batch_rows,
             tol=tol,
             max_evals=max_evals,
@@ -407,18 +406,17 @@ def test_invalid_estimation_options_raise(
     ],
 )
 def test_invalid_cohort_weights_raise(weights: tuple[core.FloatArray1D, core.FloatArray1D]) -> None:
-    adapter = NumpyAdapter(np.ones((4, 2)), predict)
+    adapter = NumpyAdapter(np.ones((2, 2)), np.ones((2, 2)), predict)
     with pytest.raises(ValueError, match="weight"):
-        core.decompose_with_turnover(adapter, n_rows=(2, 2), weights=weights, batch_rows=8)
+        core.decompose_with_turnover(adapter, weights=weights, batch_rows=8)
 
 
 def test_matched_cohort_weights_need_positive_totals() -> None:
-    adapter = NumpyAdapter(np.ones((4, 2)), predict)
+    adapter = NumpyAdapter(np.ones((2, 2)), np.ones((2, 2)), predict)
     with pytest.raises(ValueError, match="matched rows of cohort 1 have zero total weight"):
         core.decompose_with_turnover(
             adapter,
-            n_rows=(2, 2),
             batch_rows=8,
-            pairs=(np.array([0]), np.array([2])),
+            pairs=(np.array([0]), np.array([0])),
             weights=(np.array([0.0, 1.0]), np.ones(2)),
         )

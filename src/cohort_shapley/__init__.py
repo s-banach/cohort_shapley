@@ -10,7 +10,7 @@ from cohort_shapley.core import (
     IndexArray1D,
     IndexArray2D,
     decompose_independent_pairs,
-    decompose_supplied_pairs,
+    decompose_paired,
     decompose_with_turnover,
 )
 from cohort_shapley.numpy import Array2D, NumpyAdapter, PredictArray, PredictionArray
@@ -29,6 +29,6 @@ __all__ = [
     "PredictArray",
     "PredictionArray",
     "decompose_independent_pairs",
-    "decompose_supplied_pairs",
+    "decompose_paired",
     "decompose_with_turnover",
 ]

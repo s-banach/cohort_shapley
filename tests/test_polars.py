@@ -14,37 +14,37 @@ from cohort_shapley.polars import PolarsAdapter
 def test_adapters_agree_for_all_operations(*, grouped: bool) -> None:
     values = np.random.default_rng(7).normal(size=(30, 3))
     values[:, 2] = 1
-    feature_groups = np.array([0, 0, 1]) if grouped else np.arange(3)
+    feature_groups = (0, 0, 1) if grouped else range(3)
     numpy_adapter = NumpyAdapter(
-        values, lambda x: x[:, 0] * x[:, 1] + x[:, 2], feature_group_of_column=feature_groups
+        values[:15],
+        values[15:],
+        lambda x: x[:, 0] * x[:, 1] + x[:, 2],
+        feature_group_of_column=feature_groups,
     )
     polars_adapter = PolarsAdapter(
-        pl.DataFrame(values, schema=["x", "y", "z"]),
+        pl.DataFrame(values[:15], schema=["x", "y", "z"]),
+        pl.DataFrame(values[15:], schema=["x", "y", "z"]),
         lambda frame: numpy_adapter.predict(frame.to_numpy()),
         feature_group_of_column=feature_groups,
     )
-    pairs = (np.arange(5, 15), np.arange(15, 25))
+    pairs = (np.arange(5, 15), np.arange(10))
     weights = (np.arange(1.0, 16.0), np.arange(1.0, 16.0))
     results = [
         (
-            core.decompose_supplied_pairs(
+            core.decompose_paired(
                 adapter,
-                n_rows=(15, 15),
-                pairs=pairs,
-                weights=np.arange(1.0, 11.0),
+                weights=np.arange(1.0, 16.0),
                 batch_rows=16,
                 max_evals=1000,
             ),
             core.decompose_independent_pairs(
                 adapter,
-                n_rows=(15, 15),
                 weights=weights,
                 batch_rows=16,
                 max_evals=1000,
             ),
             core.decompose_with_turnover(
                 adapter,
-                n_rows=(15, 15),
                 pairs=pairs,
                 weights=weights,
                 batch_rows=16,
@@ -79,8 +79,11 @@ def test_mixed_hybrids_preserve_schema_nulls_and_feature_groups() -> None:
         assert_frame_equal(hybrid, expected)
         return np.array([1, 2], dtype=np.float32)
 
-    adapter = PolarsAdapter(frame, predict, feature_group_of_column=np.array([0, 0, 1]))
-    assert adapter.frame is frame
+    cohort_1, cohort_2 = frame[:1], frame[1:]
+    adapter = PolarsAdapter(cohort_1, cohort_2, predict, feature_group_of_column=[0, 0, 1])
+    assert adapter.cohort_1 is cohort_1
+    assert adapter.cohort_2 is cohort_2
+    assert adapter.n_rows == (1, 2)
     result = adapter.evaluate(np.array([[0, 1], [1, 2]]), np.array([[True, False], [True, False]]))
     assert result.dtype == np.float64
     np.testing.assert_array_equal(result, [1, 2])
@@ -89,25 +92,25 @@ def test_mixed_hybrids_preserve_schema_nulls_and_feature_groups() -> None:
 def test_unchanged_groups_need_only_endpoint_evaluations() -> None:
     values = np.array([[1.0, 2.0, 3.0], [5.0, 2.0, 3.0]])
     adapters: tuple[core.Adapter, ...] = (
-        NumpyAdapter(values, lambda rows: rows.sum(axis=1)),
-        PolarsAdapter(pl.DataFrame(values), lambda frame: frame.sum_horizontal().to_numpy()),
+        NumpyAdapter(values[:1], values[1:], lambda rows: rows.sum(axis=1)),
+        PolarsAdapter(
+            pl.DataFrame(values[:1]),
+            pl.DataFrame(values[1:]),
+            lambda frame: frame.sum_horizontal().to_numpy(),
+        ),
     )
     for adapter in adapters:
-        supplied = core.decompose_supplied_pairs(
-            adapter, n_rows=(1, 1), pairs=(np.array([0]), np.array([1])), batch_rows=8, max_evals=2
-        )
-        independent = core.decompose_independent_pairs(
-            adapter, n_rows=(1, 1), batch_rows=8, max_evals=2
-        )
+        paired = core.decompose_paired(adapter, batch_rows=8, max_evals=2)
+        independent = core.decompose_independent_pairs(adapter, batch_rows=8, max_evals=2)
         turnover = core.decompose_with_turnover(
-            adapter, n_rows=(1, 1), pairs=(np.array([0]), np.array([1])), batch_rows=8, max_evals=2
+            adapter, pairs=(np.array([0]), np.array([0])), batch_rows=8, max_evals=2
         )
-        for result in (supplied, independent):
+        for result in (paired, independent):
             np.testing.assert_array_equal(result.contributions, [4.0, 0.0, 0.0])
         np.testing.assert_array_equal(
             turnover.contributions, [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
         )
-        for result in (supplied, independent, turnover):
+        for result in (paired, independent, turnover):
             np.testing.assert_array_equal(result.stderr, 0)
             assert result.n_evals == 2
             assert result.converged
@@ -122,7 +125,7 @@ def test_polars_equality_and_grouping() -> None:
         }
     )
     adapter = PolarsAdapter(
-        frame, lambda x: np.zeros(x.height), feature_group_of_column=np.array([0, 1, 1])
+        frame[:2], frame[2:], lambda x: np.zeros(x.height), feature_group_of_column=(0, 1, 1)
     )
     np.testing.assert_array_equal(
         adapter.differs(np.array([[0, 1], [0, 2]])), [[False, False], [True, True]]
@@ -133,11 +136,42 @@ def test_object_columns_and_invalid_groups_raise() -> None:
     with pytest.raises(ValueError, match="Object"):
         PolarsAdapter(
             pl.DataFrame({"x": pl.Series([object()], dtype=pl.Object)}),
+            pl.DataFrame({"x": [1.0]}),
             lambda x: np.zeros(x.height),
         )
     with pytest.raises(ValueError, match="feature_group_of_column"):
         PolarsAdapter(
             pl.DataFrame({"x": [1.0]}),
+            pl.DataFrame({"x": [1.0]}),
             lambda x: np.zeros(x.height),
-            feature_group_of_column=np.array([1]),
+            feature_group_of_column=[1],
         )
+
+
+@pytest.mark.parametrize(
+    "cohort_2",
+    [
+        pl.DataFrame({"y": [1.0], "x": [2.0]}),
+        pl.DataFrame({"x": [1], "y": [2.0]}),
+        pl.DataFrame({"x": [1.0], "z": [2.0]}),
+        pl.DataFrame({"x": [1.0]}),
+    ],
+)
+def test_mismatched_schemas_raise(cohort_2: pl.DataFrame) -> None:
+    with pytest.raises(ValueError, match="matching ordered schemas"):
+        PolarsAdapter(
+            pl.DataFrame({"x": [1.0], "y": [2.0]}), cohort_2, lambda x: np.zeros(x.height)
+        )
+
+
+def test_source_changes_and_same_cohort_gathers() -> None:
+    cohort_1 = pl.DataFrame({"x": [0.0, 0.0]})
+    cohort_2 = pl.DataFrame({"x": [0.0, 0.0]})
+    adapter = PolarsAdapter(cohort_1, cohort_2, lambda x: x["x"].to_numpy())
+    cohort_1[1, "x"] = 2.0
+    cohort_2[0, "x"] = 3.0
+    pairs = np.array([[0, 1], [1, 2], [2, 3]])
+    np.testing.assert_array_equal(adapter.differs(pairs), [[True], [True], [True]])
+    np.testing.assert_array_equal(
+        adapter.evaluate(pairs, np.array([[True], [True], [False]])), [2, 3, 3]
+    )

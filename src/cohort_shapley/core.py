@@ -1,7 +1,7 @@
 """Decompose weighted mean prediction changes over pairs of observations.
 
-Each operation takes an `Adapter` that supplies hybrid predictions, difference detection and the feature group count.
-Rows use one numbering: rows of cohort 1 precede rows of cohort 2.
+Each operation takes an `Adapter` that supplies cohort sizes, hybrid predictions, difference detection and the feature group count.
+Adapter methods use shared row numbering: rows of cohort 1 precede rows of cohort 2.
 `adapter.differs` identifies feature groups that cannot affect a comparison; those groups receive zero contribution and standard error.
 See `Adapter` for the prediction and comparison contracts.
 
@@ -46,7 +46,6 @@ from cohort_shapley._games import Game
 from cohort_shapley._model import Model
 
 N_COHORTS = 2
-PAIR_SIZE = 2
 
 __all__ = [
     "Adapter",
@@ -58,7 +57,7 @@ __all__ = [
     "IndexArray1D",
     "IndexArray2D",
     "decompose_independent_pairs",
-    "decompose_supplied_pairs",
+    "decompose_paired",
     "decompose_with_turnover",
 ]
 
@@ -100,28 +99,29 @@ class Decomposition:
     stop_reason: StopReason
 
 
-def decompose_supplied_pairs(
+def decompose_paired(
     adapter: Adapter,
     *,
-    n_rows: tuple[int, int],
-    pairs: tuple[IndexArray1D, IndexArray1D],
     batch_rows: int,
     weights: FloatArray1D | None = None,
     tol: float = 1e-3,
     max_evals: int = 50_000_000,
     seed: int | None = 0,
 ) -> Attribution:
-    """Decompose the weighted mean prediction change over the supplied pairs.
+    """Decompose the weighted mean prediction change between aligned cohort rows.
 
-    Pairs may repeat rows and may use either cohort on either side.
+    The cohorts must have equal lengths; row i of cohort 1 pairs with row i of cohort 2.
     `weights` gives one weight per pair; omitted weights give equal pair weights.
-    The contributions sum to the paired mean change, which need not equal the full cohort mean change.
-    Endpoint evaluations cover the distinct rows of positive-weight pairs.
+    Endpoint evaluations cover the rows of positive-weight pairs.
     """
+    n_rows = adapter.n_rows
     _validate_options(n_rows, adapter.n_feature_groups, batch_rows, tol, max_evals)
-    first_rows, second_rows = _pairs(pairs, sum(n_rows))
+    if n_rows[0] != n_rows[1]:
+        raise ValueError("paired cohorts must have equal row counts")
+    first_rows = np.arange(n_rows[0])
+    second_rows = first_rows + n_rows[0]
     w = _weights(weights, len(first_rows), "pairs")
-    used = np.unique(np.concatenate((first_rows[w > 0], second_rows[w > 0])))
+    used = np.concatenate((first_rows[w > 0], second_rows[w > 0]))
     model, predictions = _endpoints(
         adapter,
         batch_rows=batch_rows,
@@ -137,7 +137,6 @@ def decompose_supplied_pairs(
 def decompose_independent_pairs(
     adapter: Adapter,
     *,
-    n_rows: tuple[int, int],
     batch_rows: int,
     weights: tuple[FloatArray1D, FloatArray1D] | None = None,
     tol: float = 1e-3,
@@ -150,6 +149,7 @@ def decompose_independent_pairs(
     `weights` gives one array per cohort; omitted weights give equal observation weights.
     Independence refers to selecting observations from the two cohorts.
     """
+    n_rows = adapter.n_rows
     _validate_options(n_rows, adapter.n_feature_groups, batch_rows, tol, max_evals)
     w = _cohort_weights(weights, n_rows)
     used = np.flatnonzero(w > 0)
@@ -168,7 +168,6 @@ def decompose_independent_pairs(
 def decompose_with_turnover(
     adapter: Adapter,
     *,
-    n_rows: tuple[int, int],
     batch_rows: int,
     weights: tuple[FloatArray1D, FloatArray1D] | None = None,
     pairs: tuple[IndexArray1D, IndexArray1D] | None = None,
@@ -179,6 +178,7 @@ def decompose_with_turnover(
     """Split the weighted mean prediction change into matched, entry, exit and weight change.
 
     Cohort turnover means entry into and exit from the cohort.
+    `pairs` contains row indices relative to cohort 1 and cohort 2, respectively.
     Pairs connect unique rows of cohort 1 to unique rows of cohort 2.
     Unpaired rows of cohort 1 are exits, and unpaired rows of cohort 2 are entrants.
     Matched pairs carry the mean of their two rows' weights, each normalized within the matched rows of its cohort.
@@ -188,13 +188,11 @@ def decompose_with_turnover(
     The four component totals sum to `total`.
     Without pairs, the independent attribution occupies the entry column.
     """
+    n_rows = adapter.n_rows
     _validate_options(n_rows, adapter.n_feature_groups, batch_rows, tol, max_evals)
     w = _cohort_weights(weights, n_rows)
-    rows_1, rows_2 = _pairs(pairs, sum(n_rows))
-    if np.any(rows_1 >= n_rows[0]) or np.any(rows_2 < n_rows[0]):
-        raise ValueError("pairs must connect rows of cohort 1 to rows of cohort 2")
-    if len(np.unique(rows_1)) != len(rows_1) or len(np.unique(rows_2)) != len(rows_2):
-        raise ValueError("each row may appear in at most one pair")
+    rows_1, rows_2 = _pairs(pairs, n_rows)
+    rows_2 = rows_2 + n_rows[0]
     used_mask = w > 0
     positive = used_mask[rows_1] | used_mask[rows_2]
     used_mask[rows_1[positive]] = used_mask[rows_2[positive]] = True
@@ -228,10 +226,8 @@ def decompose_with_turnover(
 def _validate_options(
     n_rows: tuple[int, int], n_feature_groups: int, batch_rows: int, tol: float, max_evals: int
 ) -> None:
-    if len(n_rows) != N_COHORTS or any(
-        not isinstance(n, (int, np.integer)) or isinstance(n, bool) or n < 0 for n in n_rows
-    ):
-        raise ValueError("n_rows must contain two non-negative integers")
+    if any(n < 0 for n in n_rows):
+        raise ValueError("n_rows must contain non-negative row counts")
     for name, value in (
         ("n_feature_groups", n_feature_groups),
         ("batch_rows", batch_rows),
@@ -268,25 +264,18 @@ def _cohort_weights(
 
 
 def _pairs(
-    pairs: tuple[IndexArray1D, IndexArray1D] | None, n_rows: int
+    pairs: tuple[IndexArray1D, IndexArray1D] | None, n_rows: tuple[int, int]
 ) -> tuple[IndexArray1D, IndexArray1D]:
     if pairs is None:
         return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp)
-    if len(pairs) != PAIR_SIZE:
-        raise ValueError("pairs must contain two row arrays")
-    for rows in pairs:
-        if (
-            rows.ndim != 1
-            or rows.dtype.kind not in "iu"
-            or np.any(rows < 0)
-            or np.any(rows >= n_rows)
-        ):
-            raise ValueError(
-                "pair indices must be one-dimensional integers within the shared row numbering"
-            )
     if len(pairs[0]) != len(pairs[1]):
         raise ValueError("pair arrays must have equal lengths")
-    return pairs[0].astype(np.intp, copy=False), pairs[1].astype(np.intp, copy=False)
+    for cohort, (rows, n) in enumerate(zip(pairs, n_rows, strict=True), start=1):
+        if np.any(rows < 0) or np.any(rows >= n):
+            raise ValueError(f"pair indices must be within cohort {cohort}")
+        if len(np.unique(rows)) != len(rows):
+            raise ValueError("each row may appear in at most one pair")
+    return pairs
 
 
 def _endpoints(

@@ -27,14 +27,14 @@ def decompose_frames(
         if features is not None
         else [c for c in d_1.columns if c not in (id_column, weight_column)]
     )
-    adapter = PolarsAdapter(pl.concat((d_1.select(columns), d_2.select(columns))), predict)
+    adapter = PolarsAdapter(d_1.select(columns), d_2.select(columns), predict)
     pairs = None
     if id_column is not None:
         joined = (
             d_1.select(id_column)
             .with_row_index("rows_1")
             .join(
-                d_2.select(id_column).with_row_index("rows_2", offset=d_1.height),
+                d_2.select(id_column).with_row_index("rows_2"),
                 on=id_column,
                 how="inner",
                 maintain_order="left",
@@ -54,7 +54,6 @@ def decompose_frames(
     )
     return core.decompose_with_turnover(
         adapter,
-        n_rows=(d_1.height, d_2.height),
         batch_rows=batch_rows,
         pairs=pairs,
         weights=weights,

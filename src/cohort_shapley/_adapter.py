@@ -1,5 +1,6 @@
 """Adapter protocol, prediction types and column-to-feature group assignments."""
 
+from collections.abc import Sequence
 from typing import Protocol
 
 import numpy as np
@@ -16,6 +17,11 @@ class Adapter(Protocol):
     Methods receive read-only arrays valid only during the call.
     Keep the observations and feature groups unchanged throughout decomposition.
     """
+
+    @property
+    def n_rows(self) -> tuple[int, int]:
+        """Non-negative row counts for cohort 1 and cohort 2, respectively."""
+        ...
 
     @property
     def n_feature_groups(self) -> int:
@@ -42,18 +48,18 @@ class Adapter(Protocol):
 
 
 def column_feature_groups(
-    n_columns: int, feature_group_of_column: IndexArray1D | None
+    n_columns: int, feature_group_of_column: Sequence[int] | None
 ) -> IndexArray1D:
     """Copy an assignment whose feature group indices cover consecutive integers starting at zero."""
     if n_columns == 0:
         raise ValueError("at least one feature column is required")
     feature_groups = (
-        np.arange(n_columns) if feature_group_of_column is None else feature_group_of_column
+        range(n_columns) if feature_group_of_column is None else feature_group_of_column
     )
-    if feature_groups.shape != (n_columns,) or not np.issubdtype(feature_groups.dtype, np.integer):
-        raise ValueError("feature_group_of_column must contain one integer per column")
-    unique = np.unique(feature_groups)
-    if not np.array_equal(unique, np.arange(len(unique))):
+    if len(feature_groups) != n_columns:
+        raise ValueError("feature_group_of_column must contain one group index per column")
+    unique = sorted(set(feature_groups))
+    if unique != list(range(len(unique))):
         raise ValueError(
             "feature_group_of_column must cover consecutive feature groups starting at zero"
         )

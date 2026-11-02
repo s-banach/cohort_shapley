@@ -12,20 +12,14 @@ To perform feature replacement in another data format, implement the [adapter in
 
 ## Decompose paired changes
 
-This example fits a Poisson gradient boosting model, then compares cohorts $C_1$ and $C_2$ containing the same two entities.
+This example fits a Poisson gradient boosting model, then compares cohorts $C_1$ and $C_2$ containing the same two entities in the same row order.
 `model.predict` applies the inverse link and returns predictions in response units.
-Stacking $C_1$ before $C_2$ gives pairs of row indices `(0, 2)` and `(1, 3)`.
 
 ```python
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from cohort_shapley import (
-    FloatArray1D,
-    FloatArray2D,
-    NumpyAdapter,
-    decompose_supplied_pairs,
-)
+from cohort_shapley import NumpyAdapter, decompose_paired
 
 training_features = np.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [2.0, 0.0], [2.0, 1.0]])
 training_response = np.array([1.0, 2.0, 2.0, 4.0, 5.0, 8.0])
@@ -33,20 +27,10 @@ model = HistGradientBoostingRegressor(
     loss="poisson", min_samples_leaf=1, max_iter=20, early_stopping=False, random_state=0
 ).fit(training_features, training_response)
 
-
-def predict(rows: FloatArray2D) -> FloatArray1D:
-    return np.asarray(model.predict(rows), dtype=np.float64)
-
-
 cohort_1 = np.array([[0.0, 0.0], [1.0, 0.0]])
 cohort_2 = np.array([[1.0, 1.0], [2.0, 1.0]])
-adapter = NumpyAdapter(np.vstack((cohort_1, cohort_2)), predict)
-result = decompose_supplied_pairs(
-    adapter,
-    n_rows=(2, 2),
-    pairs=(np.array([0, 1]), np.array([2, 3])),
-    batch_rows=64,
-)
+adapter = NumpyAdapter(cohort_1, cohort_2, model.predict)
+result = decompose_paired(adapter, batch_rows=64)
 print(result.contributions.round(1))
 print(round(result.total, 1))
 ```
@@ -60,9 +44,9 @@ For a fitted model with preprocessing, include the fitted transformations in `pr
 
 ## Choose the comparison
 
-Use supplied pairs to compare the same entities, independent pairs when no pairing is specified, or the decomposition with cohort turnover to separate matched changes from entry and exit.
+Use paired decomposition for cohorts with aligned rows, independent pairs when no pairing is specified, or the decomposition with cohort turnover to separate matched changes from entry and exit.
 Cohort turnover means entry into and exit from the cohort.
-The [operations table](#operations) gives the corresponding functions; the supplied-pair result covers only the selected pairs.
+The [operations table](#operations) gives the corresponding functions.
 
 ## API reference
 
@@ -74,20 +58,19 @@ The optional Polars module also exports `PredictFrame`.
 
 | Function | Pair selection and weights | Result |
 |---|---|---|
-| `decompose_supplied_pairs` | Required `pairs`; optional weights per pair. Rows can repeat, and either side can use either cohort. | `Attribution` for the weighted mean change over those pairs |
+| `decompose_paired` | Row `i` of $C_1$ paired with row `i` of $C_2$; equal row counts; optional weights per pair | `Attribution` for the weighted mean change over the aligned rows |
 | `decompose_independent_pairs` | All combinations of an observation of $C_1$ with one of $C_2$, weighted by the product of normalized cohort weights | `Attribution` for the full cohort mean change |
 | `decompose_with_turnover` | Optional unique `pairs` from $C_1$ to $C_2$; weights per observation in each cohort | `Decomposition` into matched, entry, exit, and weight change |
 
 All operations take an `adapter` that implements the `Adapter` protocol as the first argument.
-The functions use its `evaluate`, `differs`, and `n_feature_groups` automatically.
+The functions use its `n_rows`, `n_feature_groups`, `evaluate`, and `differs`.
 The other parameters are keyword-only.
 
 | Parameter | Meaning |
 |---|---|
-| `n_rows` | Required tuple of the observation counts of $C_1$ and $C_2$ in shared row numbering |
 | `batch_rows` | Required positive maximum observations passed to `evaluate` or `differs` in one call |
-| `pairs` | Tuple of index arrays holding each pair's first and second rows; supplied-pair and turnover operations only |
-| `weights=None` | Pair weights for supplied pairs; tuple of cohort weights for independent pairs and turnover |
+| `pairs=None` | Turnover only: two index arrays, one indexing $C_1$ and one indexing $C_2$ |
+| `weights=None` | One weight per aligned pair for paired decomposition; tuple of cohort weights for independent pairs and turnover |
 | `tol=1e-3` | Largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each group's `stderr`, or `stderr_total` for turnover |
 | `max_evals=50_000_000` | Maximum number of evaluated observations, including endpoints |
 | `seed=0` | Random seed; `None` uses fresh entropy |
@@ -110,26 +93,30 @@ Each contribution column sums to its component total.
 
 Both result types report `n_evals`, `converged`, and `stop_reason`.
 `n_evals` counts evaluated observations, not calls to the model.
+Repeated observations supplied as separate rows count as separate endpoint rows.
 `stop_reason` is `"tol"` when the convergence checks pass and `"max_evals"` when the remaining budget cannot fund another step.
 `converged` is true exactly when `stop_reason == "tol"`.
 Inspect these fields and the standard errors before using estimated contributions; see [numerical accuracy](#numerical-accuracy).
 
 ### Prepare observations, weights, and feature groups
 
-Store the observations of $C_1$ first and those of $C_2$ second in one array or DataFrame.
-`n_rows=(n_1, n_2)` specifies their counts.
-Every row index uses this combined numbering: row zero of $C_2$ has index `n_1`.
-`pairs=(first_rows, second_rows)` contains two integer arrays of equal length, and pair `k` compares row `first_rows[k]` with row `second_rows[k]`.
+Pass the two cohorts separately to the adapter.
+For `decompose_paired`, put corresponding observations in the same row positions and supply equal row counts.
+Select or repeat rows before constructing the adapter when the comparison requires a subset or repeated observations.
+For turnover, `pairs=(first_rows, second_rows)` contains two integer arrays of equal length.
+Pair `k` compares row `first_rows[k]` of $C_1$ with row `second_rows[k]` of $C_2$; both arrays start indexing at zero within their own cohort.
+Each observation can appear in at most one turnover pair.
 
 Weights change the average being decomposed.
-For supplied pairs, `weights` contains one weight per pair.
+For paired decomposition, `weights` contains one weight per aligned pair.
 For independent pairs and turnover, `weights=(weights_1, weights_2)` contains one weight per observation in each cohort.
 Omitting weights gives equal weights.
 Weights must be finite and non-negative, with positive total weight for every population whose mean enters the calculation.
 The functions normalize weights internally, so multiplying all weights of a population by the same positive constant leaves its mean unchanged.
 
 Use `feature_group_of_column` on either adapter to replace related columns together.
-For three columns, `feature_group_of_column=np.array([0, 0, 1])` makes the first two columns group 0 and the third column group 1.
+Pass a sequence of integers, with one group index per column in column order.
+For three columns, `feature_group_of_column=[0, 0, 1]` makes the first two columns group 0 and the third column group 1.
 Group indices must cover consecutive integers starting at zero.
 The output follows that group order.
 A group's contribution can differ from the sum of its features' separate contributions because grouping changes the allowed replacement orders.
@@ -148,18 +135,19 @@ A fitted scikit-learn pipeline's `predict` method can perform both transformatio
 
 ### Choose an input adapter
 
-`NumpyAdapter(values, predict, feature_group_of_column=...)` accepts a two-dimensional NumPy array with at least one column and a fixed-width dtype without object references.
+`NumpyAdapter(cohort_1, cohort_2, predict, feature_group_of_column=...)` accepts two-dimensional NumPy arrays with the same dtype and column count.
+Each array must have at least one column and a fixed-width dtype without object references.
 It preserves the dtype and stored feature bytes when constructing hybrid observations.
 It compares bytes when detecting unchanged features, including signed zero and NaN payloads.
 C-order, F-order, and strided source arrays are supported; hybrid arrays passed to `predict` have C order.
-Keep the source array unchanged during the calculation.
+Keep both source arrays unchanged during the calculation.
 
-`PolarsAdapter(frame, predict, feature_group_of_column=...)` preserves column names and dtypes in a Polars DataFrame.
+`PolarsAdapter(cohort_1, cohort_2, predict, feature_group_of_column=...)` accepts two Polars DataFrames with the same column names, order, and dtypes.
 Import it from `cohort_shapley.polars`; the top-level package works without installing Polars.
 Object columns are unsupported.
 Its difference detection uses Polars equality: null equals null, NaN equals NaN, and signed zeros compare equal.
 The prediction function must respect those equalities.
-Keep the source frame unchanged during the calculation.
+Keep both source frames unchanged during the calculation.
 
 This example uses a numeric and a categorical feature together as one feature group.
 
@@ -167,25 +155,20 @@ This example uses a numeric and a categorical feature together as one feature gr
 import numpy as np
 import polars as pl
 
-from cohort_shapley import FloatArray1D, decompose_supplied_pairs
+from cohort_shapley import FloatArray1D, decompose_paired
 from cohort_shapley.polars import PolarsAdapter
 
 
 def predict(rows: pl.DataFrame) -> FloatArray1D:
-    values = rows.select(
+    return rows.select(
         pl.col("amount") * pl.when(pl.col("category") == "B").then(2.0).otherwise(1.0)
     ).to_series().to_numpy()
-    return np.asarray(values, dtype=np.float64)
 
 
-frame = pl.DataFrame({"amount": [10.0, 15.0], "category": ["A", "B"]})
-adapter = PolarsAdapter(frame, predict, feature_group_of_column=np.array([0, 0]))
-result = decompose_supplied_pairs(
-    adapter,
-    n_rows=(1, 1),
-    pairs=(np.array([0]), np.array([1])),
-    batch_rows=64,
-)
+cohort_1 = pl.DataFrame({"amount": [10.0], "category": ["A"]})
+cohort_2 = pl.DataFrame({"amount": [15.0], "category": ["B"]})
+adapter = PolarsAdapter(cohort_1, cohort_2, predict, feature_group_of_column=[0, 0])
+result = decompose_paired(adapter, batch_rows=64)
 np.testing.assert_allclose(result.contributions, [20.0])
 np.testing.assert_allclose(result.total, 30.0 - 10.0)
 ```
@@ -214,11 +197,12 @@ def predict(rows: FloatArray2D) -> FloatArray1D:
     return rows[:, 0]
 
 
-adapter = NumpyAdapter(np.array([[10.0], [20.0], [12.0], [30.0]]), predict)
+cohort_1 = np.array([[10.0], [20.0]])
+cohort_2 = np.array([[12.0], [30.0]])
+adapter = NumpyAdapter(cohort_1, cohort_2, predict)
 result = decompose_with_turnover(
     adapter,
-    n_rows=(2, 2),
-    pairs=(np.array([0]), np.array([2])),
+    pairs=(np.array([0]), np.array([0])),
     batch_rows=64,
 )
 np.testing.assert_allclose(result.contributions, [[2.0, 9.0, -5.0]])
@@ -277,10 +261,13 @@ The matched feature contributions are zero; `weight_change` accounts for the ent
 
 ### Adapter interface
 
-`Adapter` is a protocol: any object with the following property and methods satisfies it, without inheritance.
+`Adapter` is a protocol: any object with the following properties and methods satisfies it, without inheritance.
+`n_rows` gives the row counts `(n_1, n_2)` of the two cohorts and stays fixed throughout decomposition.
 `n_feature_groups` gives the positive number of feature groups and stays fixed throughout decomposition.
 
 `evaluate(pairs, selections)` receives an integer array of shape `(n, 2)` and a Boolean array of shape `(n, n_feature_groups)`.
+Adapter methods use shared row numbering: rows of $C_1$ come first, so row zero of $C_2$ has index `n_1`.
+Either side of a pair can refer to either cohort; turnover calculations compare observations within each cohort as well as between cohorts.
 For each pair, it must construct the hybrid observation using the features of the pair's second row wherever a selection is true and of its first row elsewhere, then return one deterministic finite prediction.
 The return array has shape `(n,)`.
 This interface permits data sources other than NumPy arrays and Polars DataFrames.
@@ -294,7 +281,7 @@ Both methods receive read-only arrays whose contents are valid only during that 
 Keep the adapter's observations and feature groups unchanged throughout decomposition.
 
 The supplied adapters detect unchanged feature groups using their documented equality rules.
-For supplied or matched pairs, a group is unchanged if all its columns match within every positive-weight pair.
+For aligned or matched pairs, a group is unchanged if all its columns match within every positive-weight pair.
 For independent comparisons, its columns must be constant across all positive-weight rows in both populations; equal distributions alone do not qualify.
 Detected unchanged groups receive exactly zero contribution and standard error.
 
