@@ -94,6 +94,20 @@ def test_dtype_padding_controls_differences_and_survives_selection() -> None:
 
 
 @pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (np.array([[1 + 0j, 1 + 0j], [1 + 1j, 1 + 0j]]), [[True, False]]),
+        (np.array([[b"aaa", b"aaa", b"aaa"], [b"aba", b"aaa", b"aaa"]]), [[True, False, False]]),
+    ],
+)
+def test_differences_in_later_bytes_of_wide_items(
+    values: np.ndarray, expected: list[list[bool]]
+) -> None:
+    adapter = NumpyAdapter(values[:1], values[1:], lambda x: np.zeros(len(x)))
+    np.testing.assert_array_equal(adapter.differs(np.array([[0, 1]])), expected)
+
+
+@pytest.mark.parametrize(
     "feature_groups",
     [
         [-1, 0],
