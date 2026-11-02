@@ -8,17 +8,11 @@ from cohort_shapley._arrays import BoolArray2D, FloatArray1D, FloatArray2D
 
 
 def kernel_coalitions(n_draws: int, n_feature_groups: int, rng: np.random.Generator) -> BoolArray2D:
-    """`n_draws` independent coalitions strictly between no feature groups and all feature groups, from the Shapley kernel: a size s with probability proportional to 1 / (s (n - s)), then the first s feature groups of a uniformly random permutation."""
+    """`n_draws` independent coalitions strictly between no feature groups and all feature groups, from the Shapley kernel: a size s with probability proportional to 1 / (s (n - s)), then s feature groups chosen uniformly by shuffling s True and n - s False entries."""
     sizes = np.arange(1, n_feature_groups)
     size_p = 1.0 / (sizes * (n_feature_groups - sizes))
     drawn = rng.choice(sizes, size=n_draws, p=size_p / size_p.sum())
-    order = np.tile(
-        np.arange(n_feature_groups, dtype=np.min_scalar_type(n_feature_groups - 1)), (n_draws, 1)
-    )
-    rng.permuted(order, axis=1, out=order)
-    coalitions = np.empty((n_draws, n_feature_groups), dtype=bool)
-    np.put_along_axis(coalitions, order, np.arange(n_feature_groups) < drawn[:, None], axis=1)
-    return coalitions
+    return rng.permuted(np.arange(n_feature_groups) < drawn[:, None], axis=1)
 
 
 def zero_sum_basis(n: int) -> FloatArray2D:

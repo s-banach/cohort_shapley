@@ -278,9 +278,11 @@ def test_stored_draw_payload_obeys_evaluation_bound(n_feature_groups: int) -> No
     predictions = np.asarray(adapter.predict(values), dtype=np.float64)
     game = matched_game(model, predictions, np.array([[0, 3], [1, 4], [2, 5]]), np.full(3, 1 / 3))
     max_evals = 1000
-    draws = _draw(model, game, (max_evals - 6) // 2, 32, np.random.default_rng(1))
+    draws = _draw(model, game, (max_evals - 6) // 2, np.random.default_rng(1))
     assert sum(
-        array.nbytes for chunk in draws for array in (chunk.packed, chunk.contrasts, chunk.totals)
+        array.nbytes
+        for block in draws.blocks
+        for array in (block.packed, block.contrasts, block.deviations)
     ) == (max_evals - 6) // 2 * (16 + (n_feature_groups + 7) // 8)
 
 

@@ -5,12 +5,20 @@ Games solve exactly when they have at most one active feature group, or when the
 """
 
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import reduce
+from typing import Self
 
 import numpy as np
 
-from cohort_shapley._arrays import BoolArray1D, FloatArray1D, FloatArray2D, UInt8Array2D
+from cohort_shapley._arrays import (
+    BoolArray1D,
+    BoolArray2D,
+    FloatArray1D,
+    FloatArray2D,
+    UInt8Array2D,
+)
 from cohort_shapley._games import EPS, Game, pair_gains
 from cohort_shapley._model import Model, coalition_sums, contrasts
 from cohort_shapley._shapley import (
@@ -30,22 +38,85 @@ MIN_GROWTH = 1.25
 MAX_GROWTH = 4.0
 # Eigenvalues of the regression's Gram matrix below this fraction of the largest count as zero.
 SINGULAR_RTOL = 1e-10
-# Draws per block of sampling and of the fitting passes.
-FIT_BLOCK = 8192
+# Draws per DrawBlock.
+DRAW_BLOCK = 8192
 # Enumeration holds a coalition mask table of one byte per coalition and active feature group, and a few arrays of 8 bytes per coalition; this bound keeps them to tens of megabytes.
 MAX_ENUMERATED_COALITIONS = 2**20
 
 
 @dataclass(frozen=True, slots=True)
-class DrawChunk:
-    """Draws of one game.
+class DrawBlock:
+    """At most DRAW_BLOCK draws of one game, sampled together.
     Draw k's coalition S_k has bit j of row packed[k] (np.packbits order) set for active feature group j.
-    With coef_k = scale * likelihood ratio, contrasts[k] = coef_k * (f(h(first_k, second_k, S_k)) - f(h(first_k, second_k, S_kᶜ))) and totals[k] = coef_k * (f(second_k) - f(first_k)).
+    With coef_k = scale * likelihood ratio, contrasts[k] = coef_k * (f(h(first_k, second_k, S_k)) - f(h(first_k, second_k, S_kᶜ))) and deviations[k] = coef_k * (f(second_k) - f(first_k)) - T for the game's total T.
     """
 
     packed: UInt8Array2D
     contrasts: FloatArray1D
-    totals: FloatArray1D
+    deviations: FloatArray1D
+
+
+@dataclass(frozen=True)
+class DrawSums:
+    """Sums and a maximum over draws of a game with total T and n active feature groups, where d_k[j] = +1 for j in S_k and -1 otherwise.
+
+    `count` is the number of draws, `gram` is sum_k d_k d_k', and `sign_residual` is sum_k d_k (contrasts[k] - T sum_j d_k[j] / n).
+    `deviation_sum` adds, over blocks, the correctly rounded sum of deviations[k].
+    `abs_total_sum` and `abs_total_max` are the sum and maximum of |coef_k * (f(second_k) - f(first_k))|, the absolute draw totals.
+    """
+
+    count: int
+    gram: FloatArray2D
+    sign_residual: FloatArray1D
+    deviation_sum: float
+    abs_total_sum: float
+    abs_total_max: float
+
+    def __add__(self, other: Self) -> Self:
+        return type(self)(
+            self.count + other.count,
+            self.gram + other.gram,
+            self.sign_residual + other.sign_residual,
+            self.deviation_sum + other.deviation_sum,
+            self.abs_total_sum + other.abs_total_sum,
+            max(self.abs_total_max, other.abs_total_max),
+        )
+
+
+@dataclass(frozen=True)
+class Draws:
+    """The draws of one game and their sums."""
+
+    blocks: tuple[DrawBlock, ...]
+    sums: DrawSums
+
+    def __add__(self, other: Self) -> Self:
+        return type(self)(self.blocks + other.blocks, self.sums + other.sums)
+
+
+def no_draws(n_active: int) -> Draws:
+    """No blocks, with zero sums."""
+    return Draws((), DrawSums(0, np.zeros((n_active, n_active)), np.zeros(n_active), 0.0, 0.0, 0.0))
+
+
+def block_draws(
+    coalitions: BoolArray2D, contrasts: FloatArray1D, totals: FloatArray1D, total: float
+) -> Draws:
+    """One nonempty block of draws of a game with total `total`; `coalitions` has one column per active feature group."""
+    n_active = coalitions.shape[1]
+    signs = 2 * coalitions.astype(np.float64) - 1
+    deviations = totals - total
+    return Draws(
+        (DrawBlock(np.packbits(coalitions, axis=1), contrasts, deviations),),
+        DrawSums(
+            len(contrasts),
+            signs.T @ signs,
+            signs.T @ (contrasts - total * signs.sum(axis=1) / n_active),
+            math.fsum(deviations.tolist()),
+            float(np.abs(totals).sum()),
+            float(np.abs(totals).max()),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -61,13 +132,7 @@ class GameFit:
     checks_pass: bool
 
 
-def fit_draws(
-    draws: Sequence[DrawChunk],
-    n_active: int,
-    total: float,
-    total_rounding_bound: float,
-    block: int,
-) -> GameFit:
+def fit_draws(draws: Draws, n_active: int, total: float, total_rounding_bound: float) -> GameFit:
     """The constrained KernelSHAP fit of a game's draws, with the known-total control variate; one entry per active feature group.
 
     The fit minimizes sum_k (contrast_k - d_k . contributions)^2 subject to sum(contributions) = total, where d_k[j] = +1 for j in S_k and -1 otherwise.
@@ -75,58 +140,48 @@ def fit_draws(
     A singular Gram matrix gets the minimum-norm y and infinite standard errors.
 
     Draw k's influence on contributions is psi_k = H d_k e_k, with H = N B G^+ B' for N draws, Gram matrix G = B' (sum_k d_k d_k') B and residual e_k = contrast_k - d_k . contributions.
-    The control variate subtracts beta (mean of u), where u_k = totals[k] - total has expectation zero and beta is the least-squares slope of psi on u over the same draws, which biases the estimate by O(1 / N).
-    When the standard deviation of the totals is within 8 EPS max |totals| + `total_rounding_bound`, the totals differ only by rounding and beta is 0.
-    The standard error is the norm of the adjusted influences psi_k - beta (u_k - mean u) over sqrt(N (N - 1)).
+    The control variate subtracts slope (mean of u), where u_k = deviations[k], the draw total minus `total`, has expectation zero and slope is the least-squares slope of psi on u over the same draws, which biases the estimate by O(1 / N).
+    When the standard deviation of the draw totals is within 8 EPS max |draw total| + `total_rounding_bound`, the draw totals differ only by rounding and slope is 0.
+    The standard error is the norm of the adjusted influences psi_k - slope (u_k - mean u) over sqrt(N (N - 1)).
 
-    The sampled totals agree with the full-data total when |mean u| is at most TOTAL_AGREEMENT_SE standard errors of mean u, plus a rounding allowance of 8 EPS mean |totals| + `total_rounding_bound`.
+    The sampled draw totals agree with the full-data total when |mean u| is at most TOTAL_AGREEMENT_SE standard errors of mean u, plus a rounding allowance of 8 EPS mean |draw total| + `total_rounding_bound`.
 
-    The design passes over the draws three times, `block` draws at a time; a separate streaming reduction computes the mean total deviation.
-    These passes never form an array with one row per draw.
+    The contributions come from `draws.sums`.
+    The influences depend on the contributions, and u_k - mean u depends on every draw, so the sum of squared u_k - mean u, the slope and the standard errors each take a pass over the blocks; the slope pass is skipped when slope is 0.
+    Expanding the squared adjusted influences into sums over draws would cancel catastrophically when u nearly explains psi.
     """
-    n = sum(len(chunk.contrasts) for chunk in draws)
+    sums = draws.sums
+    n = sums.count
     if n == 0:
         return _no_draws_fit(n_active, total)
-    sign_gram = np.zeros((n_active, n_active))
-    sign_residual = np.zeros(n_active)
-    abs_total_sum = 0.0
-    abs_total_max = 0.0
-    for signs, values, totals in _blocks(draws, n_active, block):
-        sign_gram += signs.T @ signs
-        sign_residual += signs.T @ (values - total * signs.sum(axis=1) / n_active)
-        abs_total_sum += float(np.abs(totals).sum())
-        abs_total_max = max(abs_total_max, float(np.abs(totals).max()))
     basis = zero_sum_basis(n_active)
-    eigenvalues, eigenvectors = np.linalg.eigh(basis.T @ sign_gram @ basis)
+    eigenvalues, eigenvectors = np.linalg.eigh(basis.T @ sums.gram @ basis)
     kept = eigenvalues > SINGULAR_RTOL * eigenvalues[-1]
     gram_pinv = (eigenvectors[:, kept] / eigenvalues[kept]) @ eigenvectors[:, kept].T
-    contributions = total / n_active + basis @ (gram_pinv @ (basis.T @ sign_residual))
+    contributions = total / n_active + basis @ (gram_pinv @ (basis.T @ sums.sign_residual))
     if n == 1 or not kept.all():
         return GameFit(contributions, np.full(n_active, np.inf), checks_pass=False)
     influence = n * (basis @ gram_pinv @ basis.T)
-    u_mean = (
-        math.fsum(
-            math.fsum(chunk.totals[start : start + block] - total)
-            for chunk in draws
-            for start in range(0, len(chunk.totals), block)
+    u_mean = sums.deviation_sum / n
+    s_vv = sum(_squared_norm(block.deviations - u_mean) for block in draws.blocks)
+    rounding = 8 * EPS * sums.abs_total_max + total_rounding_bound
+    if math.sqrt(s_vv / n) <= rounding:
+        slope = np.zeros(n_active)
+    else:
+        sign_covariance = sum(
+            (_sign_covariance(block, contributions, u_mean=u_mean) for block in draws.blocks),
+            start=np.zeros(n_active),
         )
-        / n
+        slope = influence @ sign_covariance / s_vv
+    squares = sum(
+        (
+            _adjusted_squares(block, contributions, influence, slope, u_mean=u_mean)
+            for block in draws.blocks
+        ),
+        start=np.zeros(n_active),
     )
-    s_pv = np.zeros(n_active)
-    s_vv = 0.0
-    for signs, values, totals in _blocks(draws, n_active, block):
-        v = totals - total - u_mean
-        s_pv += _influences(signs, values, contributions, influence).T @ v
-        s_vv += float(v @ v)
-    rounding = 8 * EPS * abs_total_max + total_rounding_bound
-    slope = np.zeros(n_active) if math.sqrt(s_vv / n) <= rounding else s_pv / s_vv
-    squares = np.zeros(n_active)
-    for signs, values, totals in _blocks(draws, n_active, block):
-        v = totals - total - u_mean
-        adjusted = _influences(signs, values, contributions, influence) - np.outer(v, slope)
-        squares += (adjusted**2).sum(axis=0)
     stderr = np.sqrt(squares / (n * (n - 1)))
-    allowance = 8 * EPS * abs_total_sum / n + total_rounding_bound
+    allowance = 8 * EPS * sums.abs_total_sum / n + total_rounding_bound
     u_se = math.sqrt(s_vv / (n * (n - 1)))
     agrees = abs(u_mean) <= TOTAL_AGREEMENT_SE * u_se + allowance
     return GameFit(contributions - slope * u_mean, stderr, checks_pass=n >= MIN_DRAWS and agrees)
@@ -139,22 +194,44 @@ def _no_draws_fit(n_active: int, total: float) -> GameFit:
     )
 
 
-def _influences(
-    signs: FloatArray2D, values: FloatArray1D, contributions: FloatArray1D, influence: FloatArray2D
-) -> FloatArray2D:
-    """psi_k = H d_k e_k for each draw of a block, with e_k = contrast_k - d_k . contributions."""
-    return (signs @ influence) * (values - signs @ contributions)[:, None]
+def _squared_norm(values: FloatArray1D) -> float:
+    return float(values @ values)
 
 
-def _blocks(
-    draws: Sequence[DrawChunk], n_active: int, block: int
-) -> Iterator[tuple[FloatArray2D, FloatArray1D, FloatArray1D]]:
-    """The draws `block` at a time: signs d (+1 in S, -1 outside), contrasts and totals."""
-    for chunk in draws:
-        for start in range(0, len(chunk.contrasts), block):
-            rows = slice(start, start + block)
-            bits = np.unpackbits(chunk.packed[rows], axis=1, count=n_active)
-            yield 2 * bits.astype(np.float64) - 1, chunk.contrasts[rows], chunk.totals[rows]
+def _signs(block: DrawBlock, n_active: int) -> FloatArray2D:
+    """d_k for each draw of the block: +1 in S_k, -1 outside."""
+    return 2 * np.unpackbits(block.packed, axis=1, count=n_active).astype(np.float64) - 1
+
+
+def _sign_covariance(
+    block: DrawBlock, contributions: FloatArray1D, *, u_mean: float
+) -> FloatArray1D:
+    """sum_k d_k e_k (u_k - mean u) over the block; H times its sum over all draws is sum_k psi_k (u_k - mean u)."""
+    signs = _signs(block, len(contributions))
+    return signs.T @ ((block.contrasts - signs @ contributions) * (block.deviations - u_mean))
+
+
+def _adjusted_squares(
+    block: DrawBlock,
+    contributions: FloatArray1D,
+    influence: FloatArray2D,
+    slope: FloatArray1D,
+    *,
+    u_mean: float,
+) -> FloatArray1D:
+    """sum_k (psi_k - slope (u_k - mean u))^2 over the block, for each feature group.
+
+    psi_k - slope (u_k - mean u) is the product of the row (d_k e_k, u_k - mean u) and the matrix (H; -slope), since H is symmetric.
+    """
+    signs = _signs(block, len(contributions))
+    rows = np.column_stack(
+        (
+            signs * (block.contrasts - signs @ contributions)[:, None],
+            block.deviations - u_mean,
+        )
+    )
+    adjusted = rows @ np.vstack((influence, -slope))
+    return np.einsum("kj,kj->j", adjusted, adjusted)
 
 
 @dataclass(frozen=True)
@@ -166,14 +243,14 @@ class GameState:
     """
 
     game: Game
-    draws: tuple[DrawChunk, ...]
+    draws: Draws
     fit: GameFit
     exact: bool
     n_evals: int
 
     @property
     def n_draws(self) -> int:
-        return sum(len(chunk.contrasts) for chunk in self.draws)
+        return self.draws.sums.count
 
 
 @dataclass(frozen=True)
@@ -249,9 +326,9 @@ def _initial_state(game: Game) -> GameState:
     if game.n_active <= 1:
         contributions = np.where(game.active, game.total, 0.0)
         fit = GameFit(contributions, np.zeros_like(contributions), checks_pass=True)
-        return GameState(game, (), fit, exact=True, n_evals=0)
-    fit = _expanded(_no_draws_fit(game.n_active, game.total), game.active)
-    return GameState(game, (), fit, exact=False, n_evals=0)
+        return GameState(game, no_draws(game.n_active), fit, exact=True, n_evals=0)
+    fit = _expanded_fit(_no_draws_fit(game.n_active, game.total), game.active)
+    return GameState(game, no_draws(game.n_active), fit, exact=False, n_evals=0)
 
 
 def _components(states: list[GameState]) -> list[Component]:
@@ -271,18 +348,22 @@ def _wanted_draws(states: list[GameState], tol: float) -> list[int]:
         for s in states
     ]
     scale_sum = math.fsum(scales)
-    wanted = []
-    for state, scale in zip(states, scales, strict=True):
-        n = state.n_draws
-        if state.exact:
-            wanted.append(0)
-        elif not state.fit.checks_pass:
-            wanted.append(max(MIN_DRAWS, math.ceil(MAX_GROWTH * n)))
-        else:
-            planned = _neyman_draws(scale, scale_sum, PLANNED_MARGIN * tol)
-            grown = min(max(planned, MIN_GROWTH * n), MAX_GROWTH * n)
-            wanted.append(n if planned <= n else math.ceil(grown))
-    return wanted
+    return [
+        _wanted(state, _neyman_draws(scale, scale_sum, PLANNED_MARGIN * tol))
+        for state, scale in zip(states, scales, strict=True)
+    ]
+
+
+def _wanted(state: GameState, planned: float) -> int:
+    """The draw count wanted by a game, given the `planned` draws from `_neyman_draws` when its fit passes."""
+    n = state.n_draws
+    if state.exact:
+        return 0
+    if not state.fit.checks_pass:
+        return max(MIN_DRAWS, math.ceil(MAX_GROWTH * n))
+    if planned <= n:
+        return n
+    return math.ceil(min(max(planned, MIN_GROWTH * n), MAX_GROWTH * n))
 
 
 def _neyman_draws(scale: float, scale_sum: float, tau: float) -> float:
@@ -297,39 +378,58 @@ def _step(states: list[GameState], wanted: list[int], *, budget: int) -> Step | 
     """Choose enumeration or additional draws within the evaluation allowance, or None when the allowance funds neither.
 
     The first round reserves one draw for every sampled game.
+    Every game without draws wants MIN_DRAWS, so scaling gives each sampled game at least one draw in the first round.
     Enumeration requires at most MAX_ENUMERATED_COALITIONS coalitions and costs at most the evaluations spent sampling the game plus those requested for the next step.
+    Games are considered for enumeration in order.
     """
     first_round = any(not s.exact and s.n_draws == 0 for s in states)
-    new = [max(0, n - s.n_draws) if not s.exact else 0 for s, n in zip(states, wanted, strict=True)]
-    reserve = [2 if first_round and n else 0 for n in new]
-    enumerated = []
-    for i, state in enumerate(states):
-        cost = _enumeration_cost(state.game)
-        chosen = (
-            new[i] > 0
-            and 2**state.game.n_active <= MAX_ENUMERATED_COALITIONS
-            and cost <= 2 * wanted[i]
-            and cost <= budget - (sum(reserve) - reserve[i])
+    new = [max(0, n - s.n_draws) for s, n in zip(states, wanted, strict=True)]
+    reserves = [2 if first_round and n else 0 for n in new]
+    costs = [_enumeration_cost(s.game) for s in states]
+    eligible = [
+        n > 0 and 2**s.game.n_active <= MAX_ENUMERATED_COALITIONS and cost <= 2 * w
+        for s, n, w, cost in zip(states, new, wanted, costs, strict=True)
+    ]
+    enumerated = _enumerated(
+        eligible,
+        [cost - reserve for cost, reserve in zip(costs, reserves, strict=True)],
+        budget - sum(reserves),
+    )
+    remaining = budget - sum(cost for cost, e in zip(costs, enumerated, strict=True) if e)
+    sampled = [0 if e else n for n, e in zip(new, enumerated, strict=True)]
+    n_sampled = sum(n > 0 for n in sampled)
+    if first_round and remaining < 2 * n_sampled:
+        raise ValueError(
+            f"max_evals leaves {remaining} rows after endpoint predictions and exact games; "
+            f"the first estimation round needs at least {2 * n_sampled}"
         )
-        enumerated.append(chosen)
-        if chosen:
-            budget -= cost
-            reserve[i] = 0
-            new[i] = 0
-    if first_round and any(new):
-        n_sampled = sum(n > 0 for n in new)
-        if budget < 2 * n_sampled:
-            raise ValueError(
-                f"max_evals leaves {budget} rows after endpoint predictions and exact games; "
-                f"the first estimation round needs at least {2 * n_sampled}"
-            )
-        count = min(MIN_DRAWS, budget // (2 * n_sampled))
-        return Step(tuple(enumerated), tuple(count if n else 0 for n in new))
-    fraction = min(1.0, budget / (2 * sum(new))) if any(new) else 0.0
-    counts = tuple(math.floor(fraction * n) for n in new)
+    counts = _scaled(sampled, remaining)
     if not any(enumerated) and not any(counts):
         return None
-    return Step(tuple(enumerated), counts)
+    return Step(enumerated, counts)
+
+
+def _enumerated(eligible: Sequence[bool], extra: Sequence[int], budget: int) -> tuple[bool, ...]:
+    """Enumerate each eligible game in order whose `extra` evaluations, added to those of the games already enumerated, fit within `budget`.
+
+    A game's `extra` evaluations are its enumeration cost minus the evaluations reserved for its first-round draw.
+    """
+
+    def choose(
+        chosen: tuple[tuple[bool, ...], int], game: tuple[bool, int]
+    ) -> tuple[tuple[bool, ...], int]:
+        flags, spent = chosen
+        is_eligible, game_extra = game
+        take = is_eligible and spent + game_extra <= budget
+        return (*flags, take), spent + (game_extra if take else 0)
+
+    return reduce(choose, zip(eligible, extra, strict=True), ((), 0))[0]
+
+
+def _scaled(sampled: Sequence[int], budget: int) -> tuple[int, ...]:
+    """The draw counts `sampled` scaled down in proportion, rounding down, so that their two rows per draw fit within `budget`."""
+    cost = 2 * sum(sampled)
+    return tuple(n * min(budget, cost) // max(cost, 1) for n in sampled)
 
 
 def _enumeration_cost(game: Game) -> int:
@@ -350,77 +450,83 @@ def _advance(
     if enumerate_game:
         return replace(
             state,
-            draws=(),
+            draws=no_draws(game.n_active),
             fit=_enumerated_fit(model, game),
             exact=True,
             n_evals=state.n_evals + _enumeration_cost(game),
         )
     if new_draws == 0:
         return state
-    draws = state.draws + _draw(model, game, new_draws, FIT_BLOCK, rng)
-    fitted = fit_draws(
-        draws,
-        game.n_active,
-        game.total,
-        game.total_rounding_bound,
-        FIT_BLOCK,
-    )
+    draws = state.draws + _draw(model, game, new_draws, rng)
+    fitted = fit_draws(draws, game.n_active, game.total, game.total_rounding_bound)
     return replace(
         state,
         draws=draws,
-        fit=_expanded(fitted, game.active),
+        fit=_expanded_fit(fitted, game.active),
         n_evals=state.n_evals + 2 * new_draws,
     )
 
 
-def _expanded(fit: GameFit, active: BoolArray1D) -> GameFit:
-    """`fit` over the active feature groups extended to every feature group, with zeros for the null feature groups."""
-    contributions = np.zeros(len(active))
-    stderr = np.zeros(len(active))
-    contributions[active] = fit.contributions
-    stderr[active] = fit.stderr
-    return GameFit(contributions, stderr, checks_pass=fit.checks_pass)
+def _expanded[A: (FloatArray1D, BoolArray2D)](values: A, active: BoolArray1D) -> A:
+    """`values`, whose last axis runs over the active feature groups, with zeros inserted for the null feature groups."""
+    return np.insert(values, np.cumsum(active)[~active], 0, axis=-1)
 
 
-def _draw(
-    model: Model, game: Game, n: int, block: int, rng: np.random.Generator
-) -> tuple[DrawChunk, ...]:
-    """`n` new draws of `game`, in chunks of `block` draws."""
-    chunks = []
-    masks = np.zeros((min(n, block), len(game.active)), dtype=bool)
-    for start in range(0, n, block):
-        size = min(block, n - start)
-        pairs, ratio = game.pair_distribution.draw(size, rng)
-        coef = game.scale * ratio
-        coalitions = kernel_coalitions(size, game.n_active, rng)
-        masks[:size, game.active] = coalitions
-        chunks.append(
-            DrawChunk(
-                np.packbits(coalitions, axis=1),
-                coef * contrasts(model, pairs, masks[:size]),
-                coef * pair_gains(game.predictions, pairs),
-            )
-        )
-    return tuple(chunks)
+def _expanded_fit(fit: GameFit, active: BoolArray1D) -> GameFit:
+    return GameFit(
+        _expanded(fit.contributions, active), _expanded(fit.stderr, active), fit.checks_pass
+    )
+
+
+def _draw(model: Model, game: Game, n: int, rng: np.random.Generator) -> Draws:
+    """`n` new draws of `game`, DRAW_BLOCK at a time."""
+    return sum(
+        (
+            _draw_block(model, game, min(DRAW_BLOCK, n - start), rng)
+            for start in range(0, n, DRAW_BLOCK)
+        ),
+        start=no_draws(game.n_active),
+    )
+
+
+def _draw_block(model: Model, game: Game, n: int, rng: np.random.Generator) -> Draws:
+    pairs, ratio = game.pair_distribution.draw(n, rng)
+    coef = game.scale * ratio
+    coalitions = kernel_coalitions(n, game.n_active, rng)
+    return block_draws(
+        coalitions,
+        coef * contrasts(model, pairs, _expanded(coalitions, game.active)),
+        coef * pair_gains(game.predictions, pairs),
+        game.total,
+    )
 
 
 def _enumerated_fit(model: Model, game: Game) -> GameFit:
-    """The exact Shapley values of `game` from every pair on every coalition of its active feature groups, with pairs taken max(1, batch_rows // 2) at a time."""
-    n_active = game.n_active
-    codes = np.arange(1, 2**n_active - 1)
-    masks = np.zeros((len(codes), n_active), dtype=bool)
-    for bit in range(n_active):
-        masks[:, bit] = (codes >> bit) & 1
-    table = np.zeros(2**n_active)
-    table[-1] = game.total
+    """The exact Shapley values of `game` from every pair on every coalition of its active feature groups."""
+    gains = _coalition_gains(model, game)
+    contributions = shapley_values(np.concatenate(([0.0], gains, [game.total])))
+    return _expanded_fit(
+        GameFit(contributions, np.zeros_like(contributions), checks_pass=True), game.active
+    )
+
+
+def _coalition_gains(model: Model, game: Game) -> FloatArray1D:
+    """The gain of every coalition strictly between no active feature groups and all of them, indexed by code minus one, with pairs taken max(1, batch_rows // 2) at a time."""
+    codes = np.arange(1, 2**game.n_active - 1)
+    masks = ((codes[:, None] >> np.arange(game.n_active)) & 1).astype(bool)
     pair_distribution = game.pair_distribution
     n_pairs, weight_total = pair_distribution.n_pairs, pair_distribution.weight_total
     span = max(1, model.batch_rows // 2)
-    for start in range(0, n_pairs, span):
-        pairs, weights = pair_distribution.chunk(start, min(start + span, n_pairs))
-        coef = game.scale * weights / weight_total
-        table[1:-1] += coalition_sums(model, game, pairs, coef=coef, masks=masks)
-    del codes, masks
-    contributions = np.zeros(len(game.active))
-    contributions[game.active] = shapley_values(table)
-    return GameFit(contributions, np.zeros_like(contributions), checks_pass=True)
+    chunks = (
+        pair_distribution.chunk(start, min(start + span, n_pairs))
+        for start in range(0, n_pairs, span)
+    )
+    return sum(
+        (
+            coalition_sums(
+                model, game, pairs, coef=game.scale * weights / weight_total, masks=masks
+            )
+            for pairs, weights in chunks
+        ),
+        start=np.zeros(len(codes)),
+    )
