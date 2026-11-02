@@ -1,0 +1,69 @@
+[project]
+name = "cohort-shapley"
+version = "0.1.0"
+description = "Shapley attribution of the change in weighted mean prediction between two cohorts"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.5"]
+
+[project.optional-dependencies]
+polars = ["polars>=2.1"]
+
+[dependency-groups]
+dev = [
+    "polars>=2.1",
+    "pyrefly>=1.4",
+    "ruff>=0.17",
+    "pytest>=9.2",
+    "pydantic>=2",
+    "scikit-learn>=1.9.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.6,<1.0"]
+build-backend = "uv_build"
+
+[tool.pyrefly]
+preset = "strict"
+project-includes = ["src", "tests"]
+search-path = ["src", "."]
+python-version = "3.12"
+
+[tool.pyrefly.errors]
+missing-import = "error"
+implicit-any = "error"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "I",
+    "UP",
+    "B",
+    "C",
+    "S",
+    "INP",
+    "PYI",
+    "PT",
+    "BLE",
+    "SIM",
+    "RUF",
+    "FBT",
+    "SIM",
+    "PERF",
+    "PTH",
+    "ARG",
+    "TC",
+    "D102",
+    "D103",
+    "PL",
+]
+ignore = [
+    "PLR0913"
+]
+
+per-file-ignores."tests/*" = ["D", "S", "PLR"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
