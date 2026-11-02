@@ -1,15 +1,14 @@
-"""Weight normalization, component accounting and numerical games."""
+"""Weight normalization, turnover accounting and numerical games."""
 
 from dataclasses import dataclass
 from math import fsum
-from typing import Literal, Self
+from typing import Self
 
 import numpy as np
 
 from cohort_shapley._arrays import FloatArray1D, IndexArray1D
 from cohort_shapley._games import (
     EPS,
-    AttributedComponent,
     Game,
     IndependentPairs,
     MatchedPairs,
@@ -17,20 +16,15 @@ from cohort_shapley._games import (
 )
 from cohort_shapley._model import Model
 
-type Component = Literal["matched", "entry", "exit", "weight_change"]
-ATTRIBUTED_COMPONENTS: tuple[AttributedComponent, ...] = ("matched", "entry", "exit")
-
 
 @dataclass(frozen=True)
 class Accounting:
-    """Exact component totals and their numerical games.
+    """Numerical games of the matched, entry and exit components, and the exact weight change."""
 
-    `total` sums the attributed game totals and weight change.
-    """
-
-    total: float
-    component_totals: dict[Component, float]
-    games: list[Game]
+    matched: Game
+    entry: Game
+    exit: Game
+    weight_change: float
 
 
 @dataclass(frozen=True)
@@ -42,8 +36,9 @@ class WeightedRows:
 
     @classmethod
     def from_weights(cls, rows: IndexArray1D, weights: FloatArray1D) -> Self:
-        positive = weights > 0
-        return cls(rows[positive], weights[positive])
+        """The positive-weight entries of `rows`, with `weights` in shared row numbering."""
+        w = weights[rows]
+        return cls(rows[w > 0], w[w > 0])
 
 
 def _share(part: WeightedRows, rest: WeightedRows) -> float:
@@ -76,7 +71,6 @@ def independent_game(
     first_population: WeightedRows,
     second_population: WeightedRows,
     *,
-    component: AttributedComponent,
     scale: float = 1.0,
 ) -> Game:
     """Pair independent populations, with total scale * (mean of second_population - mean of first_population).
@@ -84,7 +78,11 @@ def independent_game(
     Both means are measured from the prediction of the heaviest row of first_population, so constant predictions give exactly zero.
     Correctly rounded sums of weight times prediction differences have rounding error bounded by 8 EPS times scale times the sum of their weighted absolute differences.
     Comparing every positive-weight row with one reference row identifies feature groups that cannot change any pair's prediction.
+    When either population has no rows, the game has no pairs, a total of zero and no active feature groups.
     """
+    if not (len(first_population.rows) and len(second_population.rows)):
+        no_rows = np.empty(0, dtype=np.intp)
+        return matched_game(model, predictions, no_rows, no_rows, np.empty(0))
     reference_row = first_population.rows[np.argmax(first_population.weights)]
     reference = predictions[reference_row]
     first_mean, first_magnitude = _measured_means(first_population, predictions, reference)
@@ -98,7 +96,6 @@ def independent_game(
     rows = np.concatenate((first_population.rows, second_population.rows))
     _, active = model.changes(np.full(len(rows), reference_row, dtype=np.intp), rows)
     return Game(
-        component,
         predictions,
         pairs,
         scale,
@@ -133,7 +130,6 @@ def matched_game(
     gains = predictions[second_rows] - predictions[first_rows]
     proposal = defensive_proposal(weights, gains) if len(weights) else np.empty(0)
     return Game(
-        "matched",
         predictions,
         MatchedPairs(first_rows, second_rows, weights, proposal),
         fsum(weights),
@@ -144,12 +140,12 @@ def matched_game(
 
 
 def cohort_game(model: Model, predictions: FloatArray1D, weights: FloatArray1D, n_1: int) -> Game:
+    """Pair every positive-weight row of cohort 1 with every positive-weight row of cohort 2; cohort 1 has the first `n_1` rows."""
     return independent_game(
         model,
         predictions,
-        WeightedRows.from_weights(np.arange(n_1), weights[:n_1]),
-        WeightedRows.from_weights(np.arange(n_1, len(weights)), weights[n_1:]),
-        component="entry",
+        WeightedRows.from_weights(np.arange(n_1), weights),
+        WeightedRows.from_weights(np.arange(n_1, len(weights)), weights),
     )
 
 
@@ -159,11 +155,11 @@ def account(
     weights: FloatArray1D,
     *,
     n_1: int,
-    rows_1: IndexArray1D,
-    rows_2: IndexArray1D,
+    first_n_matched: int,
 ) -> Accounting:
     """Split the weighted mean change into matched, entry, exit and weight change.
 
+    The first `first_n_matched` rows of each cohort are matched pairs; later rows of cohort 1 are exits and later rows of cohort 2 are entrants.
     Matched pair weights average the two cohorts' normalized matched-row weights, omega_1 and omega_2.
     Weight change is sum((omega_2 - omega_1) * ((f_1 - r) + (f_2 - r))) / 2, with r the prediction of the heaviest pair's row of cohort 1.
     Measuring from r gives exactly zero weight change for constant matched predictions.
@@ -171,54 +167,21 @@ def account(
     Exit compares exits to matched rows of cohort 1, scaled by the exits' share of the weight of cohort 1.
     These comparisons preserve precision when entrants or exits dominate a cohort's weight.
     """
-    if not len(rows_1):
-        return _accounting([cohort_game(model, predictions, weights, n_1)], 0.0)
+    rows_1 = np.arange(first_n_matched)
+    rows_2 = rows_1 + n_1
     omega_1 = normalised_weights(weights[rows_1], "matched rows of cohort 1")
     omega_2 = normalised_weights(weights[rows_2], "matched rows of cohort 2")
     pair_weights = (omega_1 + omega_2) / 2
     reference = predictions[rows_1[np.argmax(pair_weights)]]
     measured = (predictions[rows_1] - reference) + (predictions[rows_2] - reference)
     weight_change = fsum((omega_2 - omega_1) * measured) / 2
-    games = [matched_game(model, predictions, rows_1, rows_2, pair_weights)]
-    unmatched = weights > 0
-    unmatched[rows_1] = unmatched[rows_2] = False
-    exits_rows = np.flatnonzero(unmatched[:n_1])
-    entrants_rows = np.flatnonzero(unmatched[n_1:]) + n_1
-    if len(entrants_rows):
-        matched_rows_2 = np.sort(rows_2)
-        matched_2 = WeightedRows.from_weights(matched_rows_2, weights[matched_rows_2])
-        entrants = WeightedRows.from_weights(entrants_rows, weights[entrants_rows])
-        games.append(
-            independent_game(
-                model,
-                predictions,
-                matched_2,
-                entrants,
-                component="entry",
-                scale=_share(entrants, matched_2),
-            )
-        )
-    if len(exits_rows):
-        matched_rows_1 = np.sort(rows_1)
-        matched_1 = WeightedRows.from_weights(matched_rows_1, weights[matched_rows_1])
-        exits = WeightedRows.from_weights(exits_rows, weights[exits_rows])
-        games.append(
-            independent_game(
-                model,
-                predictions,
-                exits,
-                matched_1,
-                component="exit",
-                scale=_share(exits, matched_1),
-            )
-        )
-    return _accounting(games, weight_change)
-
-
-def _accounting(games: list[Game], weight_change: float) -> Accounting:
-    totals: dict[Component, float] = {
-        **dict.fromkeys(ATTRIBUTED_COMPONENTS, 0.0),
-        **{game.component: game.total for game in games},
-        "weight_change": weight_change,
-    }
-    return Accounting(fsum(totals.values()), totals, games)
+    matched = matched_game(model, predictions, rows_1, rows_2, pair_weights)
+    matched_1 = WeightedRows.from_weights(rows_1, weights)
+    matched_2 = WeightedRows.from_weights(rows_2, weights)
+    exits = WeightedRows.from_weights(np.arange(first_n_matched, n_1), weights)
+    entrants = WeightedRows.from_weights(np.arange(n_1 + first_n_matched, len(weights)), weights)
+    entry = independent_game(
+        model, predictions, matched_2, entrants, scale=_share(entrants, matched_2)
+    )
+    exit_ = independent_game(model, predictions, exits, matched_1, scale=_share(exits, matched_1))
+    return Accounting(matched, entry, exit_, weight_change)

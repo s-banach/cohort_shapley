@@ -5,7 +5,7 @@ import pytest
 
 from tests.cohorts import cohorts, features, nonlinear
 from tests.oracle import oracle_contributions
-from tests.preparation import decompose_frames
+from tests.preparation import components, decompose_frames
 
 SEEDS = range(200)
 
@@ -15,16 +15,17 @@ def _coverage(n_matched: int, n_exits: int, n_entrants: int, n_features: int, to
     d_1, d_2 = cohorts(
         0, n_matched=n_matched, n_exits=n_exits, n_entrants=n_entrants, n_features=n_features
     )
-    expected = oracle_contributions(
-        nonlinear, d_1, d_2, features(n_features), id_column="id", weight_column="w"
-    ).sum(axis=1)
+    expected = sum(
+        oracle_contributions(
+            nonlinear, d_1, d_2, features(n_features), id_column="id", weight_column="w"
+        )
+    )
     covered = []
     for seed in SEEDS:
         result = decompose_frames(
             nonlinear,
             d_1,
             d_2,
-            batch_rows=8192,
             id_column="id",
             weight_column="w",
             tol=tol,
@@ -32,7 +33,8 @@ def _coverage(n_matched: int, n_exits: int, n_entrants: int, n_features: int, to
         )
         assert np.all(result.stderr_total > 0)
         covered.append(
-            np.abs(result.contributions.sum(axis=1) - expected) <= 2 * result.stderr_total
+            np.abs(sum(c.contributions for c in components(result)) - expected)
+            <= 2 * result.stderr_total
         )
     return float(np.mean(covered))
 

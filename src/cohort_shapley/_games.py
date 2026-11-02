@@ -5,13 +5,10 @@ Measuring each pair's prediction from its own first row makes the gain of a pair
 """
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
 from cohort_shapley._arrays import BoolArray1D, FloatArray1D, IndexArray1D
-
-type AttributedComponent = Literal["matched", "entry", "exit"]
 
 EPS = float(np.finfo(np.float64).eps)
 
@@ -115,7 +112,6 @@ class Game:
     Exchanging a null feature group within any pair cannot affect a prediction.
     """
 
-    component: AttributedComponent
     predictions: FloatArray1D
     pairs: MatchedPairs | IndependentPairs
     scale: float

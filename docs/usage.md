@@ -30,7 +30,7 @@ model = HistGradientBoostingRegressor(
 cohort_1 = np.array([[0.0, 0.0], [1.0, 0.0]])
 cohort_2 = np.array([[1.0, 1.0], [2.0, 1.0]])
 adapter = NumpyAdapter(cohort_1, cohort_2, model.predict)
-result = decompose_paired(adapter, batch_rows=64)
+result = decompose_paired(adapter, tol=1e-3)
 print(result.contributions.round(1))
 print(round(result.total, 1))
 ```
@@ -50,7 +50,7 @@ The [operations table](#operations) gives the corresponding functions.
 
 ## API reference
 
-Import the three operations, `Adapter`, `NumpyAdapter`, `Attribution`, and `Decomposition` from `cohort_shapley`.
+Import the three operations, `Adapter`, `NumpyAdapter`, `Attribution`, `Component`, and `Decomposition` from `cohort_shapley`.
 Array and callable type aliases are available there for annotations.
 The optional Polars module also exports `PredictFrame`.
 
@@ -60,7 +60,7 @@ The optional Polars module also exports `PredictFrame`.
 |---|---|---|
 | `decompose_paired` | Row `i` of $C_1$ paired with row `i` of $C_2$; equal row counts; optional weights per pair | `Attribution` for the weighted mean change over the aligned rows |
 | `decompose_independent_pairs` | All combinations of an observation of $C_1$ with one of $C_2$, weighted by the product of normalized cohort weights | `Attribution` for the full cohort mean change |
-| `decompose_with_turnover` | Optional unique `pairs` from $C_1$ to $C_2$; weights per observation in each cohort | `Decomposition` into matched, entry, exit, and weight change |
+| `decompose_with_turnover` | Row `i` of $C_1$ paired with row `i` of $C_2$ for `i < first_n_matched`; later rows are exits and entrants; weights per observation in each cohort | `Decomposition` into matched, entry, exit, and weight change |
 
 All operations take an `adapter` that implements the `Adapter` protocol as the first argument.
 The functions use its `n_rows`, `n_feature_groups`, `evaluate`, and `differs`.
@@ -68,34 +68,33 @@ The other parameters are keyword-only.
 
 | Parameter | Meaning |
 |---|---|
-| `batch_rows` | Required positive maximum observations passed to `evaluate` or `differs` in one call |
-| `pairs=None` | Turnover only: two index arrays, one indexing $C_1$ and one indexing $C_2$ |
+| `tol` | Required largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each group's `stderr`, or `stderr_total` for turnover |
+| `first_n_matched` | Turnover only, required: number of leading rows of each cohort that form matched pairs |
 | `weights=None` | One weight per aligned pair for paired decomposition; tuple of cohort weights for independent pairs and turnover |
-| `tol=1e-3` | Largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each group's `stderr`, or `stderr_total` for turnover |
+| `batch_rows=8192` | Maximum observations passed to `evaluate` or `differs` in one call |
 | `max_evals=50_000_000` | Maximum number of evaluated observations, including endpoints |
 | `seed=0` | Random seed; `None` uses fresh entropy |
 
 `max_evals` must cover the used endpoint observations and initial work for sampled comparisons; an insufficient budget raises `ValueError`.
-`batch_rows` limits prediction batches, not total memory.
+Choose `tol` for the scale of your predictions: for a premium in dollars, `tol=0.01` asks for standard errors of at most one cent.
+`batch_rows` limits prediction batches, not total memory, and results do not depend on it beyond floating-point rounding.
 Retained sampling draws can require roughly 500 MB at the default evaluation budget with 25 feature groups, in addition to input storage and working arrays.
-Changing `batch_rows` can also change whether a comparison is enumerated exactly.
 
 ### Results
 
 `Attribution.contributions` and `Attribution.stderr` contain one entry per feature group.
 `total` is the weighted mean prediction change for the selected comparison, and the contributions sum to it up to floating-point error.
 
-`Decomposition.contributions` and `Decomposition.stderr` have one row per feature group and three columns in the order `matched`, `entry`, `exit`.
-`component_totals` contains `matched`, `entry`, `exit`, and `weight_change`; these totals sum to `total`.
-Each contribution column sums to its component total.
-`weight_change` has no feature allocation.
-`stderr_total` combines the independent sampling variances across the three contribution columns for each group.
+`Decomposition.matched`, `Decomposition.entry`, and `Decomposition.exit` are `Component` values.
+Each has `contributions` and `stderr` with one entry per feature group, and a `total` that its contributions sum to.
+`Decomposition.weight_change` is a number with no feature allocation.
+The three component totals and `weight_change` sum to `Decomposition.total`.
+`stderr_total` combines the independent sampling variances of the three components for each group.
 
-Both result types report `n_evals`, `converged`, and `stop_reason`.
+Both result types report `n_evals` and `converged`.
 `n_evals` counts evaluated observations, not calls to the model.
 Repeated observations supplied as separate rows count as separate endpoint rows.
-`stop_reason` is `"tol"` when the convergence checks pass and `"max_evals"` when the remaining budget cannot fund another step.
-`converged` is true exactly when `stop_reason == "tol"`.
+`converged` is true when the convergence checks pass and false when the remaining budget cannot fund another step first.
 Inspect these fields and the standard errors before using estimated contributions; see [numerical accuracy](#numerical-accuracy).
 
 ### Prepare observations, weights, and feature groups
@@ -103,9 +102,9 @@ Inspect these fields and the standard errors before using estimated contribution
 Pass the two cohorts separately to the adapter.
 For `decompose_paired`, put corresponding observations in the same row positions and supply equal row counts.
 Select or repeat rows before constructing the adapter when the comparison requires a subset or repeated observations.
-For turnover, `pairs=(first_rows, second_rows)` contains two integer arrays of equal length.
-Pair `k` compares row `first_rows[k]` of $C_1$ with row `second_rows[k]` of $C_2$; both arrays start indexing at zero within their own cohort.
-Each observation can appear in at most one turnover pair.
+For turnover, put the matched observations first in both cohorts, in the same order, and pass their count as `first_n_matched`.
+Row `i` of $C_1$ then pairs with row `i` of $C_2$ for `i < first_n_matched`; the remaining rows of $C_1$ are exits and the remaining rows of $C_2$ are entrants.
+Match each observation at most once: a key that appears twice in either cohort repeats or shifts matched rows without an error.
 
 Weights change the average being decomposed.
 For paired decomposition, `weights` contains one weight per aligned pair.
@@ -168,7 +167,7 @@ def predict(rows: pl.DataFrame) -> FloatArray1D:
 cohort_1 = pl.DataFrame({"amount": [10.0], "category": ["A"]})
 cohort_2 = pl.DataFrame({"amount": [15.0], "category": ["B"]})
 adapter = PolarsAdapter(cohort_1, cohort_2, predict, feature_group_of_column=[0, 0])
-result = decompose_paired(adapter, batch_rows=64)
+result = decompose_paired(adapter, tol=1e-3)
 np.testing.assert_allclose(result.contributions, [20.0])
 np.testing.assert_allclose(result.total, 30.0 - 10.0)
 ```
@@ -176,7 +175,7 @@ np.testing.assert_allclose(result.total, 30.0 - 10.0)
 ### Include cohort turnover
 
 `decompose_with_turnover` returns feature contributions for matched entities, entry, and exit, plus a separate total for weight change.
-Its pairs must connect unique observations of $C_1$ to unique observations of $C_2$.
+It requires at least one matched pair; for cohorts without matched observations, use `decompose_independent_pairs`.
 The [turnover formulas](#turnover-formulas) define the weights and direction of each comparison.
 
 Here one entity changes its predicted value from 10 to 12, an entity with prediction 20 exits, and an entity with prediction 30 enters.
@@ -200,24 +199,13 @@ def predict(rows: FloatArray2D) -> FloatArray1D:
 cohort_1 = np.array([[10.0], [20.0]])
 cohort_2 = np.array([[12.0], [30.0]])
 adapter = NumpyAdapter(cohort_1, cohort_2, predict)
-result = decompose_with_turnover(
-    adapter,
-    pairs=(np.array([0]), np.array([0])),
-    batch_rows=64,
-)
-np.testing.assert_allclose(result.contributions, [[2.0, 9.0, -5.0]])
-assert result.component_totals == {
-    "matched": 2.0,
-    "entry": 9.0,
-    "exit": -5.0,
-    "weight_change": 0.0,
-}
-np.testing.assert_allclose(sum(result.component_totals.values()), 21.0 - 15.0)
-np.testing.assert_allclose(result.total, 6.0)
+result = decompose_with_turnover(adapter, first_n_matched=1, tol=1e-3)
+np.testing.assert_allclose(result.matched.contributions, [2.0])
+np.testing.assert_allclose(result.entry.contributions, [9.0])
+np.testing.assert_allclose(result.exit.contributions, [-5.0])
+assert result.weight_change == 0.0
+np.testing.assert_allclose(result.total, 21.0 - 15.0)
 ```
-
-If no pairs are supplied, the independent-pair decomposition occupies the `entry` column, and the other components are zero.
-Use the independent-pair operation directly when you only need one contribution per feature group.
 
 #### Turnover formulas
 
@@ -225,7 +213,7 @@ Let $f$ denote the supplied prediction function.
 Write $\Delta$ for the change in weighted mean prediction from $C_1$ to $C_2$.
 Unpaired observations of $C_1$ are exits, and unpaired observations of $C_2$ are entrants.
 
-When pairs are supplied, both sets of matched observations must have positive total weight.
+Both sets of matched observations must have positive total weight.
 Index the matched entities by $i$, writing $p_i$ and $q_i$ for their observations in $C_1$ and $C_2$.
 Let $\alpha_i$ and $\beta_i$ be the weights of $p_i$ and $q_i$, normalized within the matched observations of their respective cohorts.
 Let $\mu_{M,1}$ and $\mu_{M,2}$ be the weighted mean predictions of those matched observations.
@@ -245,15 +233,15 @@ The entry and exit terms compare the unmatched observations with the matched obs
 The remaining difference, $\mu_{M,2}-\mu_{M,1}$, includes changes in both predictions and weights.
 The library splits this difference into `matched` and `weight_change`, treating the two cohorts symmetrically:
 
-| Component | Total | Feature contributions |
+| Field | Total | Feature contributions |
 |---|---|---|
-| `matched` | $\sum_i(\alpha_i+\beta_i)[f(q_i)-f(p_i)]/2$ | Supplied pairs weighted by $(\alpha_i+\beta_i)/2$ |
+| `matched` | $\sum_i(\alpha_i+\beta_i)[f(q_i)-f(p_i)]/2$ | Matched pairs weighted by $(\alpha_i+\beta_i)/2$ |
 | `entry` | $s_E(\mu_E-\mu_{M,2})$ | Independent pairs from matched observations of $C_2$ to entrants, multiplied by $s_E$ |
 | `exit` | $s_X(\mu_{M,1}-\mu_X)$ | Independent pairs from exits to matched observations of $C_1$, multiplied by $s_X$ |
 | `weight_change` | $\sum_i(\beta_i-\alpha_i)[f(p_i)+f(q_i)]/2$ | No allocation to features |
 
 Adding the matched and weight-change totals gives $\sum_i[\beta_i f(q_i)-\alpha_i f(p_i)]=\mu_{M,2}-\mu_{M,1}$.
-The four component totals therefore sum to $\Delta$.
+The three component totals and `weight_change` therefore sum to $\Delta$.
 
 Weight change can affect the mean even when every matched entity keeps the same features and prediction.
 For example, predictions of 10 and 20 with weights (1, 1) in $C_1$ and (1, 3) in $C_2$ produce a mean change from 15 to 17.5.
@@ -288,7 +276,7 @@ Detected unchanged groups receive exactly zero contribution and standard error.
 ### Numerical accuracy
 
 The library evaluates endpoint predictions to obtain the total, then computes feature contributions by exact enumeration or sampling.
-It uses exact enumeration when its cost and the evaluation budget permit it; a comparison with at most one active feature group needs only its total.
+It uses exact enumeration when a comparison has at most $2^{20}$ coalitions of active feature groups and its cost and the evaluation budget permit it; a comparison with at most one active feature group needs only its total.
 The calculation treats a group as active unless difference detection establishes that its replacement cannot change a hybrid prediction.
 For larger comparisons, the library samples pairs and sets of feature groups and fits contributions constrained to sum to the known total.
 

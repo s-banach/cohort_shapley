@@ -9,29 +9,27 @@ Weights must be finite and non-negative, with a positive total wherever a weight
 Each draw selects a pair and a set of feature groups, then evaluates replacements of that set and of the remaining groups.
 Sampling continues until every feature group's estimated Monte Carlo standard error, combined across comparisons for `decompose_with_turnover`, is at most `tol`, in prediction units.
 Convergence also requires at least 960 draws per sampled comparison, a full-rank regression, and agreement between the sampled and known totals.
-Comparisons are enumerated exactly when their size, evaluation cost, and remaining budget permit it.
-`stop_reason` is "tol" on convergence and "max_evals" when the remaining allowance cannot fund another step.
+Comparisons are enumerated exactly when they have at most 2**20 coalitions of active feature groups and their evaluation cost and the remaining budget permit it.
+`converged` is false when the remaining allowance cannot fund another step before convergence.
 `seed` seeds the sampler; None draws fresh entropy.
 `max_evals` bounds evaluated rows in total.
 Retained draws take at most 16 + ceil(n_feature_groups / 8) bytes each, about 500 MB at the default allowance for 25 feature groups; other allocations add to this.
 `max_evals` must cover the endpoint rows and one draw per sampled comparison; otherwise the operation raises ValueError.
-`batch_rows` bounds the rows passed to either adapter method in one call.
+`batch_rows` bounds the rows passed to either adapter method in one call; results do not depend on it beyond floating-point rounding.
 Standard errors measure Monte Carlo uncertainty given the cohorts and model, not predictive uncertainty.
 Standard errors are infinite when a sampled comparison has fewer than two draws or a rank-deficient regression.
 A few pairs with large, offsetting contributions can understate standard errors.
 """
 
 from dataclasses import dataclass
+from math import fsum
 
 import numpy as np
 
 from cohort_shapley._accounting import (
-    ATTRIBUTED_COMPONENTS,
-    Component,
     account,
     cohort_game,
     matched_game,
-    normalised_weights,
 )
 from cohort_shapley._adapter import Adapter
 from cohort_shapley._arrays import (
@@ -41,7 +39,7 @@ from cohort_shapley._arrays import (
     IndexArray1D,
     IndexArray2D,
 )
-from cohort_shapley._estimate import Estimate, StopReason, estimate
+from cohort_shapley._estimate import Component, Estimate, estimate, stderr_total
 from cohort_shapley._games import Game
 from cohort_shapley._model import Model
 
@@ -51,10 +49,10 @@ __all__ = [
     "Adapter",
     "Attribution",
     "BoolArray2D",
+    "Component",
     "Decomposition",
     "FloatArray1D",
     "FloatArray2D",
-    "IndexArray1D",
     "IndexArray2D",
     "decompose_independent_pairs",
     "decompose_paired",
@@ -68,7 +66,7 @@ class Attribution:
 
     `contributions` sums to `total`, the attributed change in weighted mean prediction.
     `n_evals` counts evaluated rows, endpoint rows included.
-    `converged` is true when `stop_reason` is "tol".
+    `converged` says whether every standard error is at most `tol` and every sampled comparison passed its convergence checks.
     """
 
     contributions: FloatArray1D
@@ -76,35 +74,40 @@ class Attribution:
     total: float
     n_evals: int
     converged: bool
-    stop_reason: StopReason
 
 
 @dataclass(frozen=True)
 class Decomposition:
-    """Contributions and standard errors with columns matched, entry and exit.
+    """The matched, entry and exit components, and the weight change, which has no feature allocation.
 
-    `stderr_total` combines the independently sampled comparisons' standard errors per feature group.
-    `component_totals` sums to `total`, including `weight_change`, which has no feature allocation.
     `n_evals` counts evaluated rows, endpoint rows included.
-    `converged` is true when `stop_reason` is "tol".
+    `converged` says whether every entry of `stderr_total` is at most `tol` and every sampled component passed its convergence checks.
     """
 
-    contributions: FloatArray2D
-    stderr: FloatArray2D
-    stderr_total: FloatArray1D
-    total: float
-    component_totals: dict[Component, float]
+    matched: Component
+    entry: Component
+    exit: Component
+    weight_change: float
     n_evals: int
     converged: bool
-    stop_reason: StopReason
+
+    @property
+    def total(self) -> float:
+        """The weighted mean prediction change: the sum of the three component totals and `weight_change`."""
+        return fsum((self.matched.total, self.entry.total, self.exit.total, self.weight_change))
+
+    @property
+    def stderr_total(self) -> FloatArray1D:
+        """The standard error of each feature group's summed contribution, combining the independently sampled components."""
+        return stderr_total([self.matched.stderr, self.entry.stderr, self.exit.stderr])
 
 
 def decompose_paired(
     adapter: Adapter,
     *,
-    batch_rows: int,
+    tol: float,
     weights: FloatArray1D | None = None,
-    tol: float = 1e-3,
+    batch_rows: int = 8192,
     max_evals: int = 50_000_000,
     seed: int | None = 0,
 ) -> Attribution:
@@ -125,21 +128,20 @@ def decompose_paired(
     model, predictions = _endpoints(
         adapter,
         batch_rows=batch_rows,
-        n_rows=sum(n_rows),
         used=used,
         max_evals=max_evals,
     )
-    game = matched_game(model, predictions, first_rows, second_rows, normalised_weights(w, "pairs"))
+    game = matched_game(model, predictions, first_rows, second_rows, w / fsum(w))
     fitted = _estimate([game], model, tol, max_evals - len(used), seed)
-    return _attribution(game, fitted, len(used))
+    return _attribution(fitted, len(used))
 
 
 def decompose_independent_pairs(
     adapter: Adapter,
     *,
-    batch_rows: int,
+    tol: float,
     weights: tuple[FloatArray1D, FloatArray1D] | None = None,
-    tol: float = 1e-3,
+    batch_rows: int = 8192,
     max_evals: int = 50_000_000,
     seed: int | None = 0,
 ) -> Attribution:
@@ -156,70 +158,65 @@ def decompose_independent_pairs(
     model, predictions = _endpoints(
         adapter,
         batch_rows=batch_rows,
-        n_rows=sum(n_rows),
         used=used,
         max_evals=max_evals,
     )
     game = cohort_game(model, predictions, w, n_rows[0])
     fitted = _estimate([game], model, tol, max_evals - len(used), seed)
-    return _attribution(game, fitted, len(used))
+    return _attribution(fitted, len(used))
 
 
 def decompose_with_turnover(
     adapter: Adapter,
     *,
-    batch_rows: int,
+    first_n_matched: int,
+    tol: float,
     weights: tuple[FloatArray1D, FloatArray1D] | None = None,
-    pairs: tuple[IndexArray1D, IndexArray1D] | None = None,
-    tol: float = 1e-3,
+    batch_rows: int = 8192,
     max_evals: int = 50_000_000,
     seed: int | None = 0,
 ) -> Decomposition:
     """Split the weighted mean prediction change into matched, entry, exit and weight change.
 
     Cohort turnover means entry into and exit from the cohort.
-    `pairs` contains row indices relative to cohort 1 and cohort 2, respectively.
-    Pairs connect unique rows of cohort 1 to unique rows of cohort 2.
-    Unpaired rows of cohort 1 are exits, and unpaired rows of cohort 2 are entrants.
+    Row i of cohort 1 pairs with row i of cohort 2 for i below `first_n_matched`, which must be from 1 to the smaller cohort's row count.
+    Later rows of cohort 1 are exits, and later rows of cohort 2 are entrants.
     Matched pairs carry the mean of their two rows' weights, each normalized within the matched rows of its cohort.
     Entry compares matched rows of cohort 2 to entrants, scaled by the entrants' share of the weight of cohort 2.
     Exit compares exits to matched rows of cohort 1, scaled by the exits' share of the weight of cohort 1.
     Weight change measures changes in the matched rows' normalized weights and has no attribution to feature groups.
-    The four component totals sum to `total`.
-    Without pairs, the independent attribution occupies the entry column.
+    The three component totals and `weight_change` sum to `total`.
     """
     n_rows = adapter.n_rows
     _validate_options(n_rows, adapter.n_feature_groups, batch_rows, tol, max_evals)
+    if not _is_count(first_n_matched) or not 1 <= first_n_matched <= min(n_rows):
+        raise ValueError(
+            "first_n_matched must be an integer from 1 to the smaller cohort row count; "
+            "use decompose_independent_pairs for cohorts without matched rows"
+        )
     w = _cohort_weights(weights, n_rows)
-    rows_1, rows_2 = _pairs(pairs, n_rows)
-    rows_2 = rows_2 + n_rows[0]
+    rows_1 = np.arange(first_n_matched)
+    rows_2 = rows_1 + n_rows[0]
     used_mask = w > 0
-    positive = used_mask[rows_1] | used_mask[rows_2]
-    used_mask[rows_1[positive]] = used_mask[rows_2[positive]] = True
+    used_mask[rows_1] = used_mask[rows_2] = used_mask[rows_1] | used_mask[rows_2]
     used = np.flatnonzero(used_mask)
     model, predictions = _endpoints(
         adapter,
         batch_rows=batch_rows,
-        n_rows=sum(n_rows),
         used=used,
         max_evals=max_evals,
     )
-    accounting = account(model, predictions, w, n_1=n_rows[0], rows_1=rows_1, rows_2=rows_2)
-    fitted = _estimate(accounting.games, model, tol, max_evals - len(used), seed)
-    contributions = np.zeros((adapter.n_feature_groups, 3))
-    stderr = np.zeros_like(contributions)
-    for game, fit in zip(accounting.games, fitted.fits, strict=True):
-        column = ATTRIBUTED_COMPONENTS.index(game.component)
-        contributions[:, column], stderr[:, column] = fit.contributions, fit.stderr
+    accounting = account(model, predictions, w, n_1=n_rows[0], first_n_matched=first_n_matched)
+    games = [accounting.matched, accounting.entry, accounting.exit]
+    fitted = _estimate(games, model, tol, max_evals - len(used), seed)
+    matched, entry, exit_ = fitted.components
     return Decomposition(
-        contributions=contributions,
-        stderr=stderr,
-        stderr_total=fitted.stderr_total,
-        total=accounting.total,
-        component_totals=accounting.component_totals,
+        matched=matched,
+        entry=entry,
+        exit=exit_,
+        weight_change=accounting.weight_change,
         n_evals=len(used) + fitted.n_evals,
-        converged=fitted.stop_reason == "tol",
-        stop_reason=fitted.stop_reason,
+        converged=fitted.converged,
     )
 
 
@@ -233,10 +230,14 @@ def _validate_options(
         ("batch_rows", batch_rows),
         ("max_evals", max_evals),
     ):
-        if not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value < 1:
+        if not _is_count(value) or value < 1:
             raise ValueError(f"{name} must be positive and integral")
     if not (np.isfinite(tol) and tol >= 0):
         raise ValueError("tol must be finite and non-negative")
+
+
+def _is_count(value: int) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
 
 
 def _weights(weights: FloatArray1D | None, n: int, name: str) -> FloatArray1D:
@@ -263,33 +264,17 @@ def _cohort_weights(
     )
 
 
-def _pairs(
-    pairs: tuple[IndexArray1D, IndexArray1D] | None, n_rows: tuple[int, int]
-) -> tuple[IndexArray1D, IndexArray1D]:
-    if pairs is None:
-        return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp)
-    if len(pairs[0]) != len(pairs[1]):
-        raise ValueError("pair arrays must have equal lengths")
-    for cohort, (rows, n) in enumerate(zip(pairs, n_rows, strict=True), start=1):
-        if np.any(rows < 0) or np.any(rows >= n):
-            raise ValueError(f"pair indices must be within cohort {cohort}")
-        if len(np.unique(rows)) != len(rows):
-            raise ValueError("each row may appear in at most one pair")
-    return pairs
-
-
 def _endpoints(
     adapter: Adapter,
     *,
     batch_rows: int,
-    n_rows: int,
     used: IndexArray1D,
     max_evals: int,
 ) -> tuple[Model, FloatArray1D]:
     if max_evals < len(used):
         raise ValueError(f"max_evals must cover the {len(used)} used endpoint rows")
     model = Model(adapter, batch_rows)
-    predictions = np.zeros(n_rows)
+    predictions = np.zeros(sum(adapter.n_rows))
     predictions[used] = model.predict(used, used)
     return model, predictions
 
@@ -300,13 +285,12 @@ def _estimate(
     return estimate(games, model, tol=tol, budget=budget, rng=np.random.default_rng(seed))
 
 
-def _attribution(game: Game, fitted: Estimate, endpoints: int) -> Attribution:
-    fit = fitted.fits[0]
+def _attribution(fitted: Estimate, endpoints: int) -> Attribution:
+    component = fitted.components[0]
     return Attribution(
-        fit.contributions,
-        fit.stderr,
-        game.total,
+        component.contributions,
+        component.stderr,
+        component.total,
         endpoints + fitted.n_evals,
-        fitted.stop_reason == "tol",
-        fitted.stop_reason,
+        fitted.converged,
     )

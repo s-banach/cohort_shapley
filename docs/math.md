@@ -90,7 +90,7 @@ When at least one policyholder remains in both cohorts, we split $\Delta$ into t
 | Exit | Departing policyholders to continuing policyholders, using their records in $C_1$ |
 
 We apply the Shapley formula to each comparison, scaling entry by the entrants' share of $C_2$ and exit by the departing policyholders' share of $C_1$.
-The three sets of feature contributions together sum to $\Delta$.
+The three sets of feature contributions and a weight-change term, which has no feature contributions, sum to $\Delta$.
 The [code guide](usage.md#include-cohort-turnover) gives an example and the accounting formulas.
 
 ## Appendix A. The Shapley formula for a change in mean

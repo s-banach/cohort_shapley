@@ -1,13 +1,12 @@
 """Shapley values of each game from independent draws, with draw counts chosen to meet `tol`.
 
 A draw pairs one row pair (first, second) from the game's pair distribution with one Shapley-kernel coalition S of the game's active feature groups, and costs two model rows: h(first, second, S) and h(first, second, Sᶜ), where Sᶜ is the complement of S among the active feature groups.
-Games solve exactly when they have at most one active feature group, or when enumeration costs at most the evaluations already spent sampling that game plus those of the next step.
+Games solve exactly when they have at most one active feature group, or when they have at most MAX_ENUMERATED_COALITIONS coalitions and enumeration costs at most the evaluations already spent sampling that game plus those of the next step.
 """
 
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
 
 import numpy as np
 
@@ -20,8 +19,6 @@ from cohort_shapley._shapley import (
     zero_sum_basis,
 )
 
-type StopReason = Literal["tol", "max_evals"]
-
 # Sampled games converge only with at least this many draws.
 MIN_DRAWS = 960
 # The sampled mean total must agree with the full-data total within this many standard errors.
@@ -33,8 +30,10 @@ MIN_GROWTH = 1.25
 MAX_GROWTH = 4.0
 # Eigenvalues of the regression's Gram matrix below this fraction of the largest count as zero.
 SINGULAR_RTOL = 1e-10
-# Draws per block of the fitting passes.
+# Draws per block of sampling and of the fitting passes.
 FIT_BLOCK = 8192
+# Enumeration holds a coalition mask table of one byte per coalition and active feature group, and a few arrays of 8 bytes per coalition; this bound keeps them to tens of megabytes.
+MAX_ENUMERATED_COALITIONS = 2**20
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,13 +188,32 @@ class Step:
 
 
 @dataclass(frozen=True)
-class Estimate:
-    """Fits per game; `n_evals` counts the model rows spent by `estimate`."""
+class Component:
+    """Contributions and Monte Carlo standard errors of one comparison, one entry per feature group.
 
-    fits: list[GameFit]
-    stderr_total: FloatArray1D
+    `contributions` sums to `total`.
+    """
+
+    contributions: FloatArray1D
+    stderr: FloatArray1D
+    total: float
+
+
+@dataclass(frozen=True)
+class Estimate:
+    """One component per game; `n_evals` counts the model rows spent by `estimate`.
+
+    `converged` says whether every fit passes its checks with total standard errors at most `tol`.
+    """
+
+    components: list[Component]
     n_evals: int
-    stop_reason: StopReason
+    converged: bool
+
+
+def stderr_total(stderrs: Sequence[FloatArray1D]) -> FloatArray1D:
+    """The standard error of each feature group's contribution summed over independently sampled comparisons."""
+    return np.hypot.reduce(stderrs)
 
 
 def estimate(
@@ -215,17 +233,14 @@ def estimate(
     n_evals = 0
     while True:
         fits = [s.fit for s in states]
-        stderr_total = _stderr_total(fits, model.n_feature_groups)
-        if all(f.checks_pass for f in fits) and stderr_total.max(initial=0.0) <= tol:
-            return Estimate(fits, stderr_total, n_evals, "tol")
-        step = _step(
-            states,
-            _wanted_draws(states, tol),
-            model.batch_rows,
-            budget=budget - n_evals,
-        )
-        if not isinstance(step, Step):
-            return Estimate(fits, stderr_total, n_evals, step)
+        if (
+            all(f.checks_pass for f in fits)
+            and stderr_total([f.stderr for f in fits]).max(initial=0.0) <= tol
+        ):
+            return Estimate(_components(states), n_evals, converged=True)
+        step = _step(states, _wanted_draws(states, tol), budget=budget - n_evals)
+        if step is None:
+            return Estimate(_components(states), n_evals, converged=False)
         advanced = [
             _advance(model, s, enumerate_game=enumerate_game, new_draws=new, rng=rng)
             for s, enumerate_game, new in zip(states, step.enumerate, step.new_draws, strict=True)
@@ -245,10 +260,8 @@ def _initial_state(game: Game) -> GameState:
     return GameState(game, (), fit, exact=False)
 
 
-def _stderr_total(fits: list[GameFit], n_feature_groups: int) -> FloatArray1D:
-    if not fits:
-        return np.zeros(n_feature_groups)
-    return np.hypot.reduce(np.array([f.stderr for f in fits]), axis=0)
+def _components(states: list[GameState]) -> list[Component]:
+    return [Component(s.fit.contributions, s.fit.stderr, s.game.total) for s in states]
 
 
 def _wanted_draws(states: list[GameState], tol: float) -> list[int]:
@@ -286,13 +299,11 @@ def _neyman_draws(scale: float, scale_sum: float, tau: float) -> float:
     return (scale_sum / tau) * (scale / tau)
 
 
-def _step(
-    states: list[GameState], wanted: list[int], batch_rows: int, *, budget: int
-) -> Step | StopReason:
-    """Choose enumeration or additional draws within the evaluation allowance.
+def _step(states: list[GameState], wanted: list[int], *, budget: int) -> Step | None:
+    """Choose enumeration or additional draws within the evaluation allowance, or None when the allowance funds neither.
 
     The first round reserves one draw for every sampled game.
-    Enumeration requires at most `batch_rows` coalitions and costs at most the evaluations spent sampling the game plus those requested for the next step.
+    Enumeration requires at most MAX_ENUMERATED_COALITIONS coalitions and costs at most the evaluations spent sampling the game plus those requested for the next step.
     """
     first_round = any(not s.exact and s.n_draws == 0 for s in states)
     new = [max(0, n - s.n_draws) if not s.exact else 0 for s, n in zip(states, wanted, strict=True)]
@@ -302,7 +313,7 @@ def _step(
         cost = _enumeration_cost(state.game)
         chosen = (
             new[i] > 0
-            and 2**state.n_active <= batch_rows
+            and 2**state.n_active <= MAX_ENUMERATED_COALITIONS
             and cost <= 2 * wanted[i]
             and cost <= budget - (sum(reserve) - reserve[i])
         )
@@ -323,7 +334,7 @@ def _step(
     fraction = min(1.0, budget / (2 * sum(new))) if any(new) else 0.0
     counts = tuple(math.floor(fraction * n) for n in new)
     if not any(enumerated) and not any(counts):
-        return "max_evals"
+        return None
     return Step(tuple(enumerated), counts)
 
 
@@ -348,8 +359,7 @@ def _advance(
     if new_draws == 0:
         return state, 0
     game = state.game
-    block = max(FIT_BLOCK, model.batch_rows // 2)
-    draws = state.draws + _draw(model, game, new_draws, block, rng)
+    draws = state.draws + _draw(model, game, new_draws, FIT_BLOCK, rng)
     active = game.active_feature_groups
     fitted = fit_draws(
         draws,
@@ -401,9 +411,9 @@ def _enumerated_fit(model: Model, game: Game) -> GameFit:
     active = game.active_feature_groups
     n_active = len(active)
     codes = np.arange(1, 2**n_active - 1)
-    masks = np.zeros((len(codes), len(game.null_feature_groups)), dtype=bool)
-    for bit, feature_group in enumerate(active):
-        masks[:, feature_group] = (codes >> bit) & 1
+    masks = np.zeros((len(codes), n_active), dtype=bool)
+    for bit in range(n_active):
+        masks[:, bit] = (codes >> bit) & 1
     table = np.zeros(2**n_active)
     table[-1] = game.total
     pairs = game.pairs

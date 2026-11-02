@@ -95,15 +95,21 @@ def coalition_sums(
     coef: FloatArray1D,
     masks: BoolArray2D,
 ) -> FloatArray1D:
-    """Weighted gains over pairs for every coalition, measured from the prediction of each pair's first row."""
+    """Weighted gains over pairs for every coalition, measured from the prediction of each pair's first row.
+
+    `masks` has one column per active feature group of `game`.
+    """
     sums = np.zeros(len(masks))
+    active = game.active_feature_groups
     per_call = max(1, model.batch_rows // len(first_rows))
     for first in range(0, len(masks), per_call):
         block = masks[first : first + per_call]
+        selections = np.zeros((len(block) * len(first_rows), model.n_feature_groups), dtype=bool)
+        selections[:, active] = np.repeat(block, len(first_rows), axis=0)
         f = model.predict(
             np.tile(first_rows, len(block)),
             np.tile(second_rows, len(block)),
-            np.repeat(block, len(first_rows), axis=0),
+            selections,
         )
         sums[first : first + len(block)] = (
             f.reshape(len(block), len(first_rows)) - game.predictions[first_rows]

@@ -2,12 +2,11 @@ import numpy as np
 import polars as pl
 import pytest
 
-from cohort_shapley._accounting import ATTRIBUTED_COMPONENTS
 from cohort_shapley._arrays import FloatArray1D
 from cohort_shapley.polars import PredictFrame
 from tests.cohorts import cohorts, features, nonlinear
-from tests.oracle import oracle_contributions
-from tests.preparation import decompose_frames
+from tests.oracle import oracle_contributions, oracle_independent
+from tests.preparation import components, decompose_frames, decompose_frames_independently
 
 
 def within_se(error: np.ndarray, stderr: np.ndarray) -> bool:
@@ -17,14 +16,11 @@ def within_se(error: np.ndarray, stderr: np.ndarray) -> bool:
 
 def test_component_totals_and_contributions_sum_exactly() -> None:
     d_1, d_2 = cohorts(0, n_matched=2000, n_exits=300, n_entrants=400, n_features=5)
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=2e-3
-    )
-    assert sum(result.component_totals.values()) == pytest.approx(result.total, rel=1e-12)
-    for k, component in enumerate(ATTRIBUTED_COMPONENTS):
-        assert result.contributions[:, k].sum() == pytest.approx(
-            result.component_totals[component], rel=1e-9
-        )
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=2e-3)
+    totals = (result.matched.total, result.entry.total, result.exit.total, result.weight_change)
+    assert sum(totals) == pytest.approx(result.total, rel=1e-12)
+    for component in components(result):
+        assert component.contributions.sum() == pytest.approx(component.total, rel=1e-9)
     assert result.converged
     assert result.stderr_total.max() <= 2e-3
 
@@ -32,13 +28,12 @@ def test_component_totals_and_contributions_sum_exactly() -> None:
 def test_exhaustive_pairs_and_coalitions_match_brute_force() -> None:
     """The matched game enumerates from the start; the entry and exit games switch to enumeration once sampling them would cost more."""
     d_1, d_2 = cohorts(2, n_matched=40, n_exits=5, n_entrants=4, n_features=4)
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=0.0
-    )
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=0.0)
     expected = oracle_contributions(
         nonlinear, d_1, d_2, features(4), id_column="id", weight_column="w"
     )
-    np.testing.assert_allclose(result.contributions, expected, rtol=0, atol=1e-10)
+    for component, oracle in zip(components(result), expected, strict=True):
+        np.testing.assert_allclose(component.contributions, oracle, rtol=0, atol=1e-10)
     assert result.stderr_total.max() == 0
     assert result.converged
 
@@ -46,12 +41,10 @@ def test_exhaustive_pairs_and_coalitions_match_brute_force() -> None:
 def test_null_feature_group_gets_zero_in_matched_component() -> None:
     d_1, d_2 = cohorts(4, n_matched=1500, n_exits=20, n_entrants=20, n_features=10)
     d_2 = d_2.with_columns(x9=pl.concat([d_1["x9"].head(1500), d_2["x9"].tail(20)]))
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=0.02
-    )
-    assert result.contributions[9, 0] == 0.0
-    assert result.stderr[9, 0] == 0.0
-    assert np.all(result.stderr[:9, 0] > 0)
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=0.02)
+    assert result.matched.contributions[9] == 0.0
+    assert result.matched.stderr[9] == 0.0
+    assert np.all(result.matched.stderr[:9] > 0)
 
 
 def test_unit_weights_equal_in_both_periods_give_zero_weight_change() -> None:
@@ -63,10 +56,8 @@ def test_unit_weights_equal_in_both_periods_give_zero_weight_change() -> None:
     unit_weight = pl.DataFrame({"id": d_1["id"], "w": weights})
     d_1 = d_1.join(unit_weight, on="id")
     d_2 = d_2.join(unit_weight, on="id", how="left").with_columns(pl.col("w").fill_null(1.0))
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w"
-    )
-    assert result.component_totals["weight_change"] == 0.0
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w")
+    assert result.weight_change == 0.0
 
 
 def test_integer_weights_match_duplicated_rows() -> None:
@@ -83,45 +74,39 @@ def test_integer_weights_match_duplicated_rows() -> None:
         copies = d.select(pl.all().repeat_by("w").explode())
         return copies.with_columns(id=pl.col("id") * 10 + pl.int_range(pl.len()).over("id"))
 
-    weighted = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=3e-3
-    )
+    weighted = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=3e-3)
     duplicated = decompose_frames(
         nonlinear,
         duplicate(d_1),
         duplicate(d_2),
-        batch_rows=8192,
         id_column="id",
         features=features(4),
         tol=3e-3,
         seed=1,
     )
     assert duplicated.total == pytest.approx(weighted.total, rel=1e-12)
-    for component in ("matched", "entry", "exit", "weight_change"):
-        assert duplicated.component_totals[component] == pytest.approx(
-            weighted.component_totals[component], rel=1e-9, abs=1e-12
-        )
-    assert within_se(
-        weighted.contributions - duplicated.contributions,
-        np.hypot(weighted.stderr, duplicated.stderr),
+    assert (
+        duplicated.matched.total,
+        duplicated.entry.total,
+        duplicated.exit.total,
+        duplicated.weight_change,
+    ) == pytest.approx(
+        (weighted.matched.total, weighted.entry.total, weighted.exit.total, weighted.weight_change),
+        rel=1e-9,
+        abs=1e-12,
     )
+    for w, d in zip(components(weighted), components(duplicated), strict=True):
+        assert within_se(w.contributions - d.contributions, np.hypot(w.stderr, d.stderr))
 
 
-def test_no_matches_agree_with_interventional_shap_on_d_1_background() -> None:
+def test_independent_pairs_agree_with_interventional_shap_on_d_1_background() -> None:
     d_1, d_2 = cohorts(7, n_matched=0, n_exits=300, n_entrants=300, n_features=4)
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, weight_column="w", features=features(4), tol=0.01
+    result = decompose_frames_independently(
+        nonlinear, d_1, d_2, weight_column="w", features=features(4), tol=0.01
     )
-    expected = oracle_contributions(nonlinear, d_1, d_2, features(4), weight_column="w")
-    assert result.component_totals == {
-        "matched": 0.0,
-        "entry": result.total,
-        "exit": 0.0,
-        "weight_change": 0.0,
-    }
-    np.testing.assert_array_equal(result.contributions[:, [0, 2]], 0.0)
-    assert np.all(result.stderr[:, 1] > 0)
-    assert within_se(result.contributions[:, 1] - expected[:, 1], result.stderr[:, 1])
+    expected = oracle_independent(nonlinear, d_1, d_2, features(4), weight_column="w")
+    assert np.all(result.stderr > 0)
+    assert within_se(result.contributions - expected, result.stderr)
 
 
 def test_rare_changes_are_attributed_exactly() -> None:
@@ -130,14 +115,13 @@ def test_rare_changes_are_attributed_exactly() -> None:
     d_2 = d_2.with_columns(
         pl.when(pl.col("id") < 5).then(pl.col(c)).otherwise(d_1[c]) for c in features(4)
     )
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=1e-9
-    )
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=1e-9)
     expected = oracle_contributions(
         nonlinear, d_1, d_2, features(4), id_column="id", weight_column="w"
     )
-    np.testing.assert_allclose(result.contributions, expected, rtol=0, atol=1e-12)
-    assert result.component_totals["entry"] == result.component_totals["exit"] == 0.0
+    for component, oracle in zip(components(result), expected, strict=True):
+        np.testing.assert_allclose(component.contributions, oracle, rtol=0, atol=1e-12)
+    assert result.entry.total == result.exit.total == 0.0
     assert result.stderr_total.max() == 0
     assert result.converged
 
@@ -158,11 +142,14 @@ def test_rare_large_changes_among_small_ones_are_drawn() -> None:
         x = frame.to_numpy()
         return np.exp(0.3 * x[:, 0] + 0.2 * x[:, 1] + 0.1 * x[:, 2] + 0.1 * x[:, 0] * x[:, 1])
 
-    exact = decompose_frames(predict, d_1, d_2, batch_rows=8192, id_column="id", tol=0.0)
-    result = decompose_frames(predict, d_1, d_2, batch_rows=8192, id_column="id", tol=2e-3)
+    exact = decompose_frames(predict, d_1, d_2, id_column="id", tol=0.0)
+    result = decompose_frames(predict, d_1, d_2, id_column="id", tol=2e-3)
     assert exact.stderr_total.max() == 0
     assert result.converged
-    assert np.abs(result.contributions.sum(axis=1) - exact.contributions.sum(axis=1)).max() <= 2e-3
+    error = sum(c.contributions for c in components(result)) - sum(
+        c.contributions for c in components(exact)
+    )
+    assert np.abs(error).max() <= 2e-3
 
 
 def _one_entrant_differs(n: int, offset: float) -> tuple[PredictFrame, pl.DataFrame, pl.DataFrame]:
@@ -183,14 +170,9 @@ def _one_entrant_differs(n: int, offset: float) -> tuple[PredictFrame, pl.DataFr
 def test_draws_that_miss_the_total_do_not_converge(offset: float) -> None:
     n = 50_000
     predict, d_1, d_2 = _one_entrant_differs(n, offset)
-    result = decompose_frames(
-        predict, d_1, d_2, batch_rows=8192, id_column="id", max_evals=3 * n + 2_000, seed=1
-    )
+    result = decompose_frames(predict, d_1, d_2, id_column="id", max_evals=3 * n + 2_000, seed=1)
     assert not result.converged
-    assert result.stop_reason == "max_evals"
-    assert result.contributions[:, 1].sum() == pytest.approx(
-        result.component_totals["entry"], rel=1e-9
-    )
+    assert result.entry.contributions.sum() == pytest.approx(result.entry.total, rel=1e-9)
 
 
 def test_game_with_one_non_null_feature_group_is_exact() -> None:
@@ -198,10 +180,8 @@ def test_game_with_one_non_null_feature_group_is_exact() -> None:
     predict, d_1, d_2 = _one_entrant_differs(50_000, 0.0)
     d_2 = d_2.with_columns(y=pl.lit(0.0))
     full_rows = d_1.height + d_2.height
-    result = decompose_frames(
-        predict, d_1, d_2, batch_rows=8192, id_column="id", max_evals=full_rows
-    )
-    assert result.contributions[:, 1].tolist() == [result.component_totals["entry"], 0.0]
+    result = decompose_frames(predict, d_1, d_2, id_column="id", max_evals=full_rows)
+    assert result.entry.contributions.tolist() == [result.entry.total, 0.0]
     assert result.stderr_total.max() == 0
     assert result.n_evals == full_rows
     assert result.converged
@@ -209,11 +189,9 @@ def test_game_with_one_non_null_feature_group_is_exact() -> None:
 
 def test_draws_that_miss_the_total_grow_until_they_see_the_change() -> None:
     predict, d_1, d_2 = _one_entrant_differs(2_000, 0.0)
-    result = decompose_frames(predict, d_1, d_2, batch_rows=8192, id_column="id", seed=1)
+    result = decompose_frames(predict, d_1, d_2, id_column="id", seed=1)
     assert result.converged
-    assert result.contributions[:, 1].sum() == pytest.approx(
-        result.component_totals["entry"], rel=1e-9
-    )
+    assert result.entry.contributions.sum() == pytest.approx(result.entry.total, rel=1e-9)
 
 
 def test_constant_predictions_give_exactly_zero() -> None:
@@ -222,13 +200,18 @@ def test_constant_predictions_give_exactly_zero() -> None:
         lambda frame: np.full(frame.height, 1e12),
         d_1,
         d_2,
-        batch_rows=8192,
         id_column="id",
         weight_column="w",
     )
     assert result.total == 0.0
-    assert set(result.component_totals.values()) == {0.0}
-    np.testing.assert_array_equal(result.contributions, 0.0)
+    assert (
+        result.matched.total,
+        result.entry.total,
+        result.exit.total,
+        result.weight_change,
+    ) == (0.0, 0.0, 0.0, 0.0)
+    for component in components(result):
+        np.testing.assert_array_equal(component.contributions, 0.0)
 
 
 def test_heavy_entrants_are_attributed_against_the_matched_rows() -> None:
@@ -239,14 +222,14 @@ def test_heavy_entrants_are_attributed_against_the_matched_rows() -> None:
     d_1 = d_1.with_columns(w=pl.lit(1.0))
     d_2 = d_2.with_columns(w=pl.Series(np.r_[np.ones(50), np.full(500, 1e4)]))
     result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", tol=0.01, seed=1
+        nonlinear, d_1, d_2, id_column="id", weight_column="w", tol=0.01, seed=1
     )
     expected = oracle_contributions(
         nonlinear, d_1, d_2, features(3), id_column="id", weight_column="w"
     )
     assert result.converged
     assert result.n_evals <= 100_000
-    assert within_se(result.contributions[:, 1] - expected[:, 1], result.stderr[:, 1])
+    assert within_se(result.entry.contributions - expected[1], result.entry.stderr)
 
 
 @pytest.mark.parametrize(
@@ -275,8 +258,8 @@ def test_a_missed_total_below_tol_still_blocks_convergence(
         return (frame["x"] + frame["y"]).to_numpy()
 
     max_evals = d_1.height + d_2.height + 1920
-    result = decompose_frames(
-        predict, d_1, d_2, batch_rows=8192, weight_column="w", tol=1e-3, max_evals=max_evals
+    result = decompose_frames_independently(
+        predict, d_1, d_2, weight_column="w", tol=1e-3, max_evals=max_evals
     )
     assert not result.converged
 
@@ -290,9 +273,9 @@ def test_a_large_unchanged_prediction_keeps_the_precision_of_small_changes() -> 
     def predict(frame: pl.DataFrame) -> FloatArray1D:
         return (frame["x"] + frame["y"]).to_numpy()
 
-    result = decompose_frames(predict, d_1, d_2, batch_rows=8192, id_column="id")
-    assert result.component_totals["matched"] == pytest.approx(100 / 101, rel=1e-15, abs=0)
-    assert result.contributions[:, 0] == pytest.approx([100 / 101, 0.0], rel=1e-15, abs=0)
+    result = decompose_frames(predict, d_1, d_2, id_column="id")
+    assert result.matched.total == pytest.approx(100 / 101, rel=1e-15, abs=0)
+    assert result.matched.contributions == pytest.approx([100 / 101, 0.0], rel=1e-15, abs=0)
 
 
 def test_rows_passed_to_predict_stay_within_max_evals() -> None:
@@ -309,24 +292,21 @@ def test_rows_passed_to_predict_stay_within_max_evals() -> None:
         counting,
         d_1,
         d_2,
-        batch_rows=8192,
         id_column="id",
         weight_column="w",
         tol=1e-6,
         max_evals=max_evals,
     )
     assert rows == result.n_evals <= max_evals
-    assert result.stop_reason == "max_evals"
+    assert not result.converged
 
 
 def test_small_budget_shrinks_the_first_round_and_stops() -> None:
     """1,000 rows fund 500 draws, fewer than the 960 a sampled game needs to converge."""
     d_1, d_2 = cohorts(14, n_matched=2000, n_exits=0, n_entrants=0, n_features=3, weighted=False)
     max_evals = d_1.height + d_2.height + 1000
-    result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", max_evals=max_evals
-    )
-    assert result.stop_reason == "max_evals"
+    result = decompose_frames(nonlinear, d_1, d_2, id_column="id", max_evals=max_evals)
+    assert not result.converged
     assert result.n_evals == max_evals
     assert np.all(np.isfinite(result.stderr_total) & (result.stderr_total > 0))
 
@@ -337,15 +317,13 @@ def test_a_singular_fit_gives_infinite_standard_errors_to_its_active_feature_gro
     d_2 = d_2.with_columns(x3=d_1["x3"])
     max_evals = d_1.height + d_2.height + 2
     result = decompose_frames(
-        nonlinear, d_1, d_2, batch_rows=8192, id_column="id", weight_column="w", max_evals=max_evals
+        nonlinear, d_1, d_2, id_column="id", weight_column="w", max_evals=max_evals
     )
-    assert result.stop_reason == "max_evals"
-    assert result.stderr[:, 0].tolist() == [np.inf, np.inf, np.inf, 0.0]
+    assert not result.converged
+    assert result.matched.stderr.tolist() == [np.inf, np.inf, np.inf, 0.0]
     assert result.stderr_total.tolist() == [np.inf, np.inf, np.inf, 0.0]
-    assert result.contributions[3, 0] == 0.0
-    assert result.contributions[:, 0].sum() == pytest.approx(
-        result.component_totals["matched"], rel=1e-9
-    )
+    assert result.matched.contributions[3] == 0.0
+    assert result.matched.contributions.sum() == pytest.approx(result.matched.total, rel=1e-9)
 
 
 def test_budget_without_room_for_one_draw_per_game_raises() -> None:
@@ -355,7 +333,6 @@ def test_budget_without_room_for_one_draw_per_game_raises() -> None:
             nonlinear,
             d_1,
             d_2,
-            batch_rows=8192,
             id_column="id",
             weight_column="w",
             max_evals=d_1.height + d_2.height + 1,
@@ -376,7 +353,7 @@ def test_identical_rows_without_matches_cost_only_the_full_data_predictions() ->
     """Every row has x = y = 0, so every feature group is null in the one game, whose total is 0."""
     d_1 = pl.DataFrame({"x": np.zeros(3), "y": np.zeros(3), "w": [1.0, 2.0, 3.0]})
     d_2 = pl.DataFrame({"x": np.zeros(4), "y": np.zeros(4), "w": [1.0, 1.0, 5.0, 1.0]})
-    result = decompose_frames(_sum, d_1, d_2, batch_rows=8192, weight_column="w", max_evals=7)
+    result = decompose_frames_independently(_sum, d_1, d_2, weight_column="w", max_evals=7)
     assert result.converged
     assert result.n_evals == 7
     np.testing.assert_array_equal(result.contributions, 0.0)
@@ -390,14 +367,14 @@ def test_unchanged_matched_units_without_other_games_give_zero_attributions() ->
         _sum,
         d_1.with_columns(w=pl.lit(1.0)),
         d_2,
-        batch_rows=8192,
         id_column="id",
         weight_column="w",
     )
     assert result.converged
     assert result.n_evals == 10
-    assert result.component_totals["weight_change"] != 0
-    np.testing.assert_array_equal(result.contributions, 0.0)
+    assert result.weight_change != 0
+    for component in components(result):
+        np.testing.assert_array_equal(component.contributions, 0.0)
     np.testing.assert_array_equal(result.stderr_total, 0.0)
 
 
@@ -409,10 +386,8 @@ def test_first_round_reserves_one_draw_per_game_before_enumerating() -> None:
     d_2 = pl.DataFrame(
         {"id": [0, 1, 2, 3, 6, 7], "x": np.arange(6.0) + 1, "y": 2 * np.arange(6.0) + 1}
     )
-    result = decompose_frames(_sum, d_1, d_2, batch_rows=8192, id_column="id", max_evals=22)
-    assert result.stop_reason == "max_evals"
+    result = decompose_frames(_sum, d_1, d_2, id_column="id", max_evals=22)
+    assert not result.converged
     assert result.n_evals <= 22
-    for k, component in enumerate(ATTRIBUTED_COMPONENTS):
-        assert result.contributions[:, k].sum() == pytest.approx(
-            result.component_totals[component], rel=1e-9
-        )
+    for component in components(result):
+        assert component.contributions.sum() == pytest.approx(component.total, rel=1e-9)

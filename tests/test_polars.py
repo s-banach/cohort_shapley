@@ -1,5 +1,7 @@
 """Polars hybrid values, equality and agreement with the NumPy adapter."""
 
+from dataclasses import asdict
+
 import numpy as np
 import polars as pl
 import pytest
@@ -27,26 +29,28 @@ def test_adapters_agree_for_all_operations(*, grouped: bool) -> None:
         lambda frame: numpy_adapter.predict(frame.to_numpy()),
         feature_group_of_column=feature_groups,
     )
-    pairs = (np.arange(5, 15), np.arange(10))
     weights = (np.arange(1.0, 16.0), np.arange(1.0, 16.0))
     results = [
         (
             core.decompose_paired(
                 adapter,
                 weights=np.arange(1.0, 16.0),
+                tol=1e-3,
                 batch_rows=16,
                 max_evals=1000,
             ),
             core.decompose_independent_pairs(
                 adapter,
                 weights=weights,
+                tol=1e-3,
                 batch_rows=16,
                 max_evals=1000,
             ),
             core.decompose_with_turnover(
                 adapter,
-                pairs=pairs,
+                first_n_matched=10,
                 weights=weights,
+                tol=1e-3,
                 batch_rows=16,
                 max_evals=1000,
             ),
@@ -54,9 +58,7 @@ def test_adapters_agree_for_all_operations(*, grouped: bool) -> None:
         for adapter in (numpy_adapter, polars_adapter)
     ]
     for numpy_result, polars_result in zip(*results, strict=True):
-        np.testing.assert_array_equal(numpy_result.contributions, polars_result.contributions)
-        np.testing.assert_array_equal(numpy_result.stderr, polars_result.stderr)
-        assert numpy_result.n_evals == polars_result.n_evals
+        np.testing.assert_equal(asdict(numpy_result), asdict(polars_result))
 
 
 def test_mixed_hybrids_preserve_schema_nulls_and_feature_groups() -> None:
@@ -100,18 +102,15 @@ def test_unchanged_groups_need_only_endpoint_evaluations() -> None:
         ),
     )
     for adapter in adapters:
-        paired = core.decompose_paired(adapter, batch_rows=8, max_evals=2)
-        independent = core.decompose_independent_pairs(adapter, batch_rows=8, max_evals=2)
-        turnover = core.decompose_with_turnover(
-            adapter, pairs=(np.array([0]), np.array([0])), batch_rows=8, max_evals=2
-        )
-        for result in (paired, independent):
-            np.testing.assert_array_equal(result.contributions, [4.0, 0.0, 0.0])
-        np.testing.assert_array_equal(
-            turnover.contributions, [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-        )
+        paired = core.decompose_paired(adapter, tol=0, max_evals=2)
+        independent = core.decompose_independent_pairs(adapter, tol=0, max_evals=2)
+        turnover = core.decompose_with_turnover(adapter, first_n_matched=1, tol=0, max_evals=2)
+        for attribution in (paired, independent, turnover.matched):
+            np.testing.assert_array_equal(attribution.contributions, [4.0, 0.0, 0.0])
+            np.testing.assert_array_equal(attribution.stderr, 0)
+        for component in (turnover.entry, turnover.exit):
+            np.testing.assert_array_equal(component.contributions, 0)
         for result in (paired, independent, turnover):
-            np.testing.assert_array_equal(result.stderr, 0)
             assert result.n_evals == 2
             assert result.converged
 
