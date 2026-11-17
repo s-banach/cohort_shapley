@@ -2,9 +2,9 @@
 
 `cohort-shapley` decomposes the change in a model's weighted mean prediction from a cohort $C_1$ to a cohort $C_2$.
 
-The mathematical "novelty", relative to what data scientists commonly do with SHAP, is explained in [docs/math.md](docs/math.md).
+The [math guide](docs/math.md) uses car insurance premiums to show why pairing each driver's records across years can give different feature contributions from subtracting the cohorts' mean SHAP vectors for a fixed background.
 
-Usage and API reference are provided in [docs/usage.md](docs/usage.md).
+See the [usage guide](docs/usage.md) for worked examples and the API reference.
 
 Python 3.12+ and NumPy are required.
 The `polars` extra supports mixed-type DataFrames.

@@ -31,17 +31,18 @@ For example, $B$ might be the empirical distribution of the training dataset.
    If we look at the math, is there a more direct way to compute the thing we actually want?
 
 3. Have you ever tried to compute SHAP vectors at millions of points, realized it was too slow, and fallen back to TreeSHAP?
-   Does this work properly when the model applies a nonlinear link between the tree scores and the prediction?
+   Does this work properly when the model uses a nonlinear inverse link to convert the tree score to a prediction?
 
 ## 1. Compare not thyself unto thy neighbor, but unto thyself of yesterday
 
 Suppose $C_1$ and $C_2$ contain last year's and this year's records for the same car insurance policyholders.
 
-One driver lives in Michigan in both years, but her predicted premium rises as she gets older.
-Yet the `state` entry in her SHAP vector may change, because the effect of replacing Michigan with a _background state_ may depend on her age.
+One driver lives in Michigan in both years.
+Her predicted premium rises as she gets older.
+If the effect of replacing Michigan with a state from the background dataset depends on her age, the `state` entry in her SHAP vector can change from one year to the next.
 
-Applying this principle to the dataset as a whole, each policyholder in $C_1$ should be compared to herself in $C_2$ to explain the change in premium for the cohort as a whole, not to a background dataset.
-
+When we compare the driver's two records directly, replacing last year's state with this year's leaves the prediction unchanged because both records say Michigan.
+To explain the change in the cohort's mean predicted premium, we pair each policyholder's records in the same way.
 
 ## 2. Apply the Shapley formula directly to $\Delta$
 
@@ -53,9 +54,8 @@ Average the resulting predictions and subtract the original mean prediction.
 Replacing no features gives zero; replacing all features gives $\Delta$.
 The Shapley formula decomposes $\Delta$ by averaging each feature's increments across replacement orders.
 
-For example, suppose $f$ uses two features: age and annual mileage.
-For each row below, predict every driver's premium using her own age and mileage from the specified years, then average the predictions.
-Suppose we obtain:
+Suppose $f$ uses only age and annual mileage.
+Each row of the table gives the mean predicted premium when every driver's age and mileage come from the years shown.
 
 | Inputs for each driver | Mean predicted premium (dollars) |
 |---|---:|
@@ -72,8 +72,9 @@ When exact computation is too costly, we can sample drivers and feature subsets 
 
 ## 3. Can we convert TreeSHAP's answer to dollars?
 
-TreeSHAP's fast exact calculation explains the additive tree score, before the nonlinear link converts it to a prediction.
-Exponentiating, linearizing, or rescaling those contributions does not generally recover exact Shapley contributions to the prediction.
+For a premium model with a log link, TreeSHAP's fast exact calculation explains the additive tree score in log units.
+The inverse link converts that score to a premium in dollars.
+Exponentiating, linearizing, or rescaling the score contributions does not generally recover exact Shapley contributions to the premium.
 No conversion based only on the score contributions and endpoint scores can do so for all models; [Appendix C](#appendix-c-converting-score-contributions) gives the proof.
 We must apply the Shapley formula to the actual prediction function $f$.
 
@@ -89,9 +90,11 @@ When at least one policyholder remains in both cohorts, we split $\Delta$ into t
 | Entry | Continuing policyholders to entrants, using their records in $C_2$ |
 | Exit | Departing policyholders to continuing policyholders, using their records in $C_1$ |
 
-We apply the Shapley formula to each comparison, scaling entry by the entrants' share of $C_2$ and exit by the departing policyholders' share of $C_1$.
-The three sets of feature contributions and a weight-change term, which has no feature contributions, sum to $\Delta$.
-The [code guide](usage.md#include-cohort-turnover) gives an example and the accounting formulas.
+We apply the Shapley formula to each comparison.
+We scale the entry contributions by the entrants' share of the total weight in $C_2$ and the exit contributions by the departing policyholders' share of the total weight in $C_1$.
+Changes in the continuing policyholders' relative weights have a separate term.
+Adding that term to the three component totals gives $\Delta$.
+The [usage guide](usage.md#include-cohort-turnover) gives an example and the formulas.
 
 ## Appendix A. The Shapley formula for a change in mean
 
@@ -120,7 +123,7 @@ c_j=\sum_{A\subseteq D\setminus\{j\}}
 $$
 
 The coefficient is the fraction of feature replacement orders with exactly $A$ before $j$.
-Consequently, $c_j$ is the average prediction increment from replacing feature $j$, averaged over both orders and pairs.
+To obtain $c_j$, we average the change in prediction from replacing feature $j$ over all replacement orders and the distribution of pairs.
 Along every complete order, the increments sum to $f(q)-f(p)$, so
 
 $$
@@ -235,4 +238,3 @@ Applying $\sigma$ separately to each tree's terminal-node values produces a sum 
 This changes the prediction function being explained.
 For a single tree, we can transform its terminal-node predictions and explain the resulting tree exactly.
 For an ensemble, combining all trees into one tree can require a separate region for each attainable combination of terminal nodes, making the combined tree much larger.
-The efficient calculation on the separate trees therefore does not extend to arbitrary nonlinear inverse links by converting its output.

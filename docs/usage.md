@@ -40,7 +40,8 @@ print(round(result.total, 1))
 4.0
 ```
 
-For a fitted model with preprocessing, include the fitted transformations in `predict`.
+The cohort's mean prediction rose by about 4.0 units.
+The first feature contributed about 2.2 units to that increase and the second contributed about 1.8.
 
 ## Choose the comparison
 
@@ -68,7 +69,7 @@ The other parameters are keyword-only.
 
 | Parameter | Meaning |
 |---|---|
-| `tol` | Required largest estimated Monte Carlo standard error, in prediction units, with which a result reports convergence; compared with each entry of the result's `stderr` |
+| `tol` | Required. For the calculation to converge, every estimated Monte Carlo standard error in the result's `stderr` must be at most `tol`, in prediction units. |
 | `first_n_matched` | Turnover only, required: number of leading rows of each cohort that form matched pairs |
 | `weights=None` | One weight per aligned pair for paired decomposition; tuple of cohort weights for independent pairs and turnover |
 | `batch_rows=8192` | Maximum observations passed to `evaluate` or `differs` in one call |
@@ -95,8 +96,8 @@ The three component totals and `weight_change` sum to `Decomposition.total`.
 Both result types report `n_evals` and `converged`.
 `n_evals` counts evaluated observations, not calls to the model.
 Repeated observations supplied as separate rows count as separate endpoint rows.
-`converged` is true when the convergence checks pass and false when the remaining budget cannot fund another step first.
-Inspect these fields and the standard errors before using estimated contributions; see [numerical accuracy](#numerical-accuracy).
+`converged` is true when the calculation passes the [convergence checks](#numerical-accuracy).
+A false value means the remaining budget was too small to continue.
 
 ### Prepare observations, weights, and feature groups
 
@@ -104,8 +105,8 @@ Pass the two cohorts separately to the adapter.
 For `decompose_paired`, put corresponding observations in the same row positions and supply equal row counts.
 Select or repeat rows before constructing the adapter when the comparison requires a subset or repeated observations.
 For turnover, put the matched observations first in both cohorts, in the same order, and pass their count as `first_n_matched`.
-Row `i` of $C_1$ then pairs with row `i` of $C_2$ for `i < first_n_matched`; the remaining rows of $C_1$ are exits and the remaining rows of $C_2$ are entrants.
-Match each observation at most once: a key that appears twice in either cohort repeats or shifts matched rows without an error.
+The remaining rows of $C_1$ are exits and the remaining rows of $C_2$ are entrants.
+If you use a key to align the matched rows, check that each matched observation appears in exactly one pair.
 
 Weights change the average being decomposed.
 For paired decomposition, `weights` contains one weight per aligned pair.
@@ -258,13 +259,12 @@ The matched feature contributions are zero; `weight_change` accounts for the ent
 `evaluate(pairs, selections)` receives an integer array of shape `(n, 2)` and a Boolean array of shape `(n, n_feature_groups)`.
 Adapter methods use shared row numbering: rows of $C_1$ come first, so row zero of $C_2$ has index `n_1`.
 Either side of a pair can refer to either cohort; turnover calculations compare observations within each cohort as well as between cohorts.
-For each pair, it must construct the hybrid observation using the features of the pair's second row wherever a selection is true and of its first row elsewhere, then return one deterministic finite prediction.
-The return array has shape `(n,)`.
-This interface permits data sources other than NumPy arrays and Polars DataFrames.
+For each pair, take the selected feature groups from the second row and the remaining groups from the first.
+Return one deterministic, finite prediction per hybrid observation in an array of shape `(n,)`.
 
 `differs(pairs)` returns a Boolean array of shape `(n, n_feature_groups)`.
-A false entry promises that the feature group's values in the two rows are interchangeable without changing the prediction for every choice of values of the other feature groups.
-Prediction equality for a particular pair does not establish this promise when the model has interactions.
+Return `False` for a pair and feature group only if swapping that group's values preserves the prediction for every combination of values in the other groups.
+When features interact, the two original rows can have equal predictions even though swapping one group's values changes a hybrid prediction.
 False positives cost computation; false negatives can produce incorrect contributions.
 An adapter without difference detection can return `np.ones((len(pairs), self.n_feature_groups), dtype=bool)` from `differs`.
 Both methods receive read-only arrays whose contents are valid only during that call.
@@ -284,7 +284,7 @@ For larger comparisons, the library samples pairs and sets of feature groups and
 
 `stderr` estimates the Monte Carlo standard error of each contribution, conditional on the supplied cohorts and prediction function.
 It does not measure predictive uncertainty, uncertainty from model fitting, or uncertainty from sampling the cohorts themselves.
-Exact calculations have zero Monte Carlo standard error, subject to floating-point arithmetic.
+Feature contributions computed exactly have zero Monte Carlo standard error.
 
 A calculation reports convergence only if every feature group's estimated standard error is at most `tol`, in prediction units.
 For turnover, this condition applies to the combined standard error across matched, entry, and exit.
